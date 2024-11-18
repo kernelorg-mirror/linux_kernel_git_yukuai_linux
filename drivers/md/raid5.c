@@ -2950,6 +2950,23 @@ static void raid5_error(struct mddev *mddev, struct md_rdev *rdev)
 	r5c_update_on_rdev_error(mddev, rdev);
 }
 
+static void raid5_bitmap_sector(struct mddev *mddev, sector_t *offset,
+				unsigned long *sectors)
+{
+	struct r5conf *conf = mddev->private;
+	int sectors_per_chunk = conf->chunk_sectors * (conf->raid_disks -
+						       conf->max_degraded);
+	sector_t start = *offset;
+	sector_t end = start + *sectors;
+	int dd_idx;
+
+	start = round_down(start, sectors_per_chunk);
+	end = round_up(end, sectors_per_chunk);
+
+	*offset = raid5_compute_sector(conf, start, 0, &dd_idx, NULL);
+	*sectors = raid5_compute_sector(conf, end, 0, &dd_idx, NULL) - *offset;
+}
+
 /*
  * Input: a 'big' sector number,
  * Output: index of the data and parity disk, and the sector # in them.
@@ -8972,6 +8989,7 @@ static struct md_personality raid6_personality =
 	.takeover	= raid6_takeover,
 	.change_consistency_policy = raid5_change_consistency_policy,
 	.prepare_suspend = raid5_prepare_suspend,
+	.bitmap_sector	= raid5_bitmap_sector,
 };
 static struct md_personality raid5_personality =
 {
@@ -8997,6 +9015,7 @@ static struct md_personality raid5_personality =
 	.takeover	= raid5_takeover,
 	.change_consistency_policy = raid5_change_consistency_policy,
 	.prepare_suspend = raid5_prepare_suspend,
+	.bitmap_sector	= raid5_bitmap_sector,
 };
 
 static struct md_personality raid4_personality =
@@ -9023,6 +9042,7 @@ static struct md_personality raid4_personality =
 	.takeover	= raid4_takeover,
 	.change_consistency_policy = raid5_change_consistency_policy,
 	.prepare_suspend = raid5_prepare_suspend,
+	.bitmap_sector	= raid5_bitmap_sector,
 };
 
 static int __init raid5_init(void)
