@@ -212,6 +212,8 @@ struct bitmap {
 	int cluster_slot;
 };
 
+static struct workqueue_struct *md_bitmap_wq;
+
 static int __bitmap_resize(struct bitmap *bitmap, sector_t blocks,
 			   int chunksize, bool init);
 
@@ -2963,6 +2965,8 @@ static struct attribute_group md_bitmap_group = {
 };
 
 static struct bitmap_operations bitmap_ops = {
+	.version		= 1,
+
 	.enabled		= bitmap_enabled,
 	.create			= bitmap_create,
 	.resize			= bitmap_resize,
@@ -2997,7 +3001,20 @@ static struct bitmap_operations bitmap_ops = {
 	.group			= &md_bitmap_group,
 };
 
-void mddev_set_bitmap_ops(struct mddev *mddev)
+int md_bitmap_init(void)
 {
-	mddev->bitmap_ops = &bitmap_ops;
+	md_bitmap_wq = alloc_workqueue("md_bitmap", WQ_MEM_RECLAIM | WQ_UNBOUND,
+				       0);
+	if (!md_bitmap_wq)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&bitmap_ops.list);
+	register_md_bitmap(&bitmap_ops);
+	return 0;
+}
+
+void md_bitmap_exit(void)
+{
+	destroy_workqueue(md_bitmap_wq);
+	unregister_md_bitmap(&bitmap_ops);
 }
