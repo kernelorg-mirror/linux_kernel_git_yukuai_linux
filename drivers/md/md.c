@@ -705,10 +705,12 @@ static void mddev_clear_bitmap_ops(struct mddev *mddev)
 	mddev->bitmap_ops = NULL;
 }
 
+static int default_bitmap_version = 1;
+module_param(default_bitmap_version, int, 0644);
 int mddev_init(struct mddev *mddev)
 {
 	/* TODO: support more versions */
-	mddev_set_bitmap_ops(mddev, 1);
+	mddev_set_bitmap_ops(mddev, default_bitmap_version);
 
 	if (percpu_ref_init(&mddev->active_io, active_io_release,
 			    PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
@@ -10040,6 +10042,10 @@ static int __init md_init(void)
 	if (ret)
 		return ret;
 
+	ret = md_llbitmap_init();
+	if (ret)
+		goto err_bitmap;
+
 	ret = -ENOMEM;
 	md_wq = alloc_workqueue("md", WQ_MEM_RECLAIM, 0);
 	if (!md_wq)
@@ -10071,6 +10077,8 @@ err_md:
 err_misc_wq:
 	destroy_workqueue(md_wq);
 err_wq:
+	md_llbitmap_exit();
+err_bitmap:
 	md_bitmap_exit();
 	return ret;
 }
@@ -10375,6 +10383,7 @@ static __exit void md_exit(void)
 
 	destroy_workqueue(md_misc_wq);
 	destroy_workqueue(md_wq);
+	md_llbitmap_exit();
 	md_bitmap_exit();
 }
 

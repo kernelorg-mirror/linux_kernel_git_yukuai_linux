@@ -23,6 +23,9 @@
 
 #define MaxSector (~(sector_t)0)
 
+#define RESYNC_BLOCK_SIZE (64*1024)
+#define RESYNC_PAGES ((RESYNC_BLOCK_SIZE + PAGE_SIZE-1) / PAGE_SIZE)
+
 /*
  * These flags should really be called "NO_RETRY" rather than
  * "FAILFAST" because they don't make any promise about time lapse,

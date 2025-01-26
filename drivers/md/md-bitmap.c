@@ -212,6 +212,13 @@ struct bitmap {
 	int cluster_slot;
 };
 
+/* use these for bitmap->flags and bitmap->sb->state bit-fields */
+enum bitmap_state {
+	BITMAP_STALE	   = 1,  /* the bitmap file is out of date or had -EIO */
+	BITMAP_WRITE_ERROR = 2, /* A write error has occurred */
+	BITMAP_HOSTENDIAN  = 15,
+};
+
 static struct workqueue_struct *md_bitmap_wq;
 
 static int __bitmap_resize(struct bitmap *bitmap, sector_t blocks,

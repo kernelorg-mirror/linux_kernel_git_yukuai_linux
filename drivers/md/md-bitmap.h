@@ -18,13 +18,6 @@ typedef __u16 bitmap_counter_t;
 #define RESYNC_MASK ((bitmap_counter_t) (1 << (COUNTER_BITS - 2)))
 #define COUNTER_MAX ((bitmap_counter_t) RESYNC_MASK - 1)
 
-/* use these for bitmap->flags and bitmap->sb->state bit-fields */
-enum bitmap_state {
-	BITMAP_STALE	   = 1,  /* the bitmap file is out of date or had -EIO */
-	BITMAP_WRITE_ERROR = 2, /* A write error has occurred */
-	BITMAP_HOSTENDIAN  =15,
-};
-
 /* the superblock at the front of the bitmap file -- little endian */
 typedef struct bitmap_super_s {
 	__le32 magic;        /*  0  BITMAP_MAGIC */
@@ -169,6 +162,19 @@ static inline int md_bitmap_init(void)
 	return 0;
 }
 static inline void md_bitmap_exit(void)
+{
+}
+#endif
+
+#ifdef CONFIG_MD_LLBITMAP
+extern int md_llbitmap_init(void);
+extern void md_llbitmap_exit(void);
+#else
+static inline int md_llbitmap_init(void)
+{
+	return 0;
+}
+static inline void md_llbitmap_exit(void)
 {
 }
 #endif
