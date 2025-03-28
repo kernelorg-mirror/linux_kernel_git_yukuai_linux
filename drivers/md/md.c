@@ -649,13 +649,13 @@ static void active_io_release(struct percpu_ref *ref)
 
 static void no_op(struct percpu_ref *r) {}
 
-static void mddev_set_bitmap_ops(struct mddev *mddev, enum md_submodule_id id)
+static void mddev_set_bitmap_ops(struct mddev *mddev)
 {
 	xa_lock(&md_submodule);
-	mddev->bitmap_ops = xa_load(&md_submodule, id);
+	mddev->bitmap_ops = xa_load(&md_submodule, mddev->bitmap_id);
 	xa_unlock(&md_submodule);
 	if (!mddev->bitmap_ops)
-		pr_warn_once("md: can't find bitmap id %d\n", id);
+		pr_warn_once("md: can't find bitmap id %d\n", mddev->bitmap_id);
 }
 
 static void mddev_clear_bitmap_ops(struct mddev *mddev)
@@ -665,8 +665,8 @@ static void mddev_clear_bitmap_ops(struct mddev *mddev)
 
 int mddev_init(struct mddev *mddev)
 {
-	/* TODO: support more versions */
-	mddev_set_bitmap_ops(mddev, ID_BITMAP);
+	mddev->bitmap_id = ID_BITMAP;
+	mddev_set_bitmap_ops(mddev);
 
 	if (percpu_ref_init(&mddev->active_io, active_io_release,
 			    PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
@@ -4133,6 +4133,82 @@ static struct md_sysfs_entry md_new_level =
 __ATTR(new_level, 0664, new_level_show, new_level_store);
 
 static ssize_t
+bitmap_version_show(struct mddev *mddev, char *page)
+{
+	struct md_submodule_head *head;
+	unsigned long i;
+	ssize_t len = 0;
+
+	if (mddev->bitmap_id == ID_BITMAP_NONE)
+		len += sprintf(page + len, "[none] ");
+	else
+		len += sprintf(page + len, "none ");
+
+	xa_lock(&md_submodule);
+	xa_for_each(&md_submodule, i, head) {
+		if (head->type != MD_BITMAP)
+			continue;
+
+		if (mddev->bitmap_id == head->id)
+			len += sprintf(page + len, "[%s] ", head->name);
+		else
+			len += sprintf(page + len, "%s ", head->name);
+	}
+	xa_unlock(&md_submodule);
+
+	len += sprintf(page + len, "\n");
+	return len;
+}
+
+static ssize_t
+bitmap_version_store(struct mddev *mddev, const char *buf, size_t len)
+{
+	struct md_submodule_head *head;
+	enum md_submodule_id id;
+	unsigned long i;
+	int err;
+
+	if (mddev->bitmap_ops)
+		return -EBUSY;
+
+	err = kstrtoint(buf, 10, &id);
+	if (!err) {
+		if (id == ID_BITMAP_NONE) {
+			mddev->bitmap_id = id;
+			return len;
+		}
+
+		xa_lock(&md_submodule);
+		head = xa_load(&md_submodule, id);
+		xa_unlock(&md_submodule);
+
+		if (head && head->type == MD_BITMAP) {
+			mddev->bitmap_id = id;
+			return len;
+		}
+	}
+
+	if (cmd_match(buf, "none")) {
+		mddev->bitmap_id = ID_BITMAP_NONE;
+		return len;
+	}
+
+	xa_lock(&md_submodule);
+	xa_for_each(&md_submodule, i, head) {
+		if (head->type == MD_BITMAP && cmd_match(buf, head->name)) {
+			mddev->bitmap_id = head->id;
+			xa_unlock(&md_submodule);
+			return len;
+		}
+	}
+	xa_unlock(&md_submodule);
+	return -ENOENT;
+}
+
+static struct md_sysfs_entry md_bitmap_version =
+__ATTR(bitmap_version, 0664, bitmap_version_show, bitmap_version_store);
+
+static ssize_t
 layout_show(struct mddev *mddev, char *page)
 {
 	/* just a number, not meaningful for all levels */
@@ -5667,6 +5743,7 @@ __ATTR(serialize_policy, S_IRUGO | S_IWUSR, serialize_policy_show,
 static struct attribute *md_default_attrs[] = {
 	&md_level.attr,
 	&md_new_level.attr,
+	&md_bitmap_version.attr,
 	&md_layout.attr,
 	&md_raid_disks.attr,
 	&md_uuid.attr,
