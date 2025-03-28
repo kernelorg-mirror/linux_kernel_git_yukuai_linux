@@ -56,8 +56,16 @@
  *   unwritten blocks.
  * - After resync is done, change state from Syncing to Dirty first, in case
  *   Startwrite happen before the state is Clean.
+ *
+ * ##### Bitmap IO
+ *
+ * A hidden disk, named mdxxx_bitmap, is created for bitmap, see details in
+ * llbitmap_add_disk(). And a file is created as well to manage bitmap IO for
+ * this disk, see details in llbitmap_open_disk(). Read/write bitmap is
+ * converted to buffer IO to this file.
  */
 
+#define BITMAP_MAX_SECTOR (128 * 2)
 #define BITMAP_MAX_PAGES 32
 #define BITMAP_SB_SIZE 1024
 
@@ -134,6 +142,13 @@ struct llbitmap {
 	unsigned long flags;
 	__u64	events_cleared;
 };
+
+struct llbitmap_bio {
+	struct md_rdev *rdev;
+	struct bio bio;
+};
+
+static struct workqueue_struct *md_llbitmap_io_wq;
 
 static char state_machine[nr_llbitmap_state][nr_llbitmap_action] = {
 	[BitUnwritten] = {BitDirty, BitNone, BitNone, BitNone, BitNone, BitNone, BitNone, BitNone},
@@ -254,3 +269,226 @@ write_bitmap:
 
 	return state;
 }
+
+static void llbitmap_end_write(struct bio *bio)
+{
+	struct bio *parent = bio->bi_private;
+	struct llbitmap_bio *llbitmap_bio;
+	struct md_rdev *rdev;
+
+	if (bio->bi_status == BLK_STS_OK) {
+		WRITE_ONCE(parent->bi_status, BLK_STS_OK);
+	} else {
+		llbitmap_bio = container_of(bio, struct llbitmap_bio, bio);
+		rdev = llbitmap_bio->rdev;
+
+		pr_err("%s: %s: bitmap write failed for %pg\n", __func__,
+		       mdname(rdev->mddev), rdev->bdev);
+		md_error(rdev->mddev, rdev);
+	}
+
+	bio_put(bio);
+	bio_endio(parent);
+}
+
+static void md_llbitmap_retry_read(struct llbitmap *llbitmap, struct bio *bio)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&llbitmap->retry_lock, flags);
+	bio_list_add(&llbitmap->retry_list, bio);
+	queue_work(md_llbitmap_io_wq, &llbitmap->retry_work);
+	spin_unlock_irqrestore(&llbitmap->retry_lock, flags);
+}
+
+static void llbitmap_end_read(struct bio *bio)
+{
+	struct bio *parent = bio->bi_private;
+	struct llbitmap_bio *llbitmap_bio;
+	struct llbitmap *llbitmap;
+	struct md_rdev *rdev;
+
+	if (bio->bi_status == BLK_STS_OK) {
+		WRITE_ONCE(parent->bi_status, BLK_STS_OK);
+		bio_put(bio);
+		bio_endio(parent);
+		return;
+	}
+
+	llbitmap_bio = container_of(bio, struct llbitmap_bio, bio);
+	rdev = llbitmap_bio->rdev;
+	pr_err("%s: %s: bitmap read failed for %pg\n", __func__,
+	       mdname(rdev->mddev), rdev->bdev);
+	md_error(rdev->mddev, rdev);
+	bio_put(bio);
+	md_llbitmap_retry_read(llbitmap, parent);
+}
+
+static void md_llbitmap_retry_fn(struct work_struct *work)
+{
+	struct llbitmap *llbitmap =
+		container_of(work, struct llbitmap, retry_work);
+	struct mddev *mddev = llbitmap->mddev;
+	struct md_rdev *rdev;
+	struct bio *bio;
+
+again:
+	spin_lock_irq(&llbitmap->retry_lock);
+	bio = bio_list_pop(&llbitmap->retry_list);
+	spin_unlock_irq(&llbitmap->retry_lock);
+
+	if (!bio)
+		return;
+
+	rdev_for_each(rdev, mddev) {
+		struct llbitmap_bio *llbitmap_bio;
+		struct bio *new;
+
+		if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags))
+			continue;
+
+		new = bio_alloc_clone(rdev->bdev, bio, GFP_NOIO,
+				      &llbitmap->bio_set);
+		new->bi_iter.bi_sector = bio->bi_iter.bi_sector +
+					 rdev->sb_start +
+					 mddev->bitmap_info.offset;
+		new->bi_opf |= REQ_SYNC | REQ_IDLE | REQ_META;
+		new->bi_private = bio;
+		new->bi_end_io = llbitmap_end_read;
+
+		llbitmap_bio = container_of(new, struct llbitmap_bio, bio);
+		llbitmap_bio->rdev = rdev;
+
+		submit_bio_noacct(new);
+		goto again;
+	}
+}
+
+static void llbitmap_submit_bio(struct bio *bio)
+{
+	struct mddev *mddev = bio->bi_bdev->bd_disk->private_data;
+	struct llbitmap *llbitmap = mddev->bitmap;
+	struct llbitmap_bio *llbitmap_bio;
+	struct md_rdev *rdev;
+	struct bio *new;
+
+	if (unlikely(bio->bi_opf & REQ_PREFLUSH))
+		bio->bi_opf &= ~REQ_PREFLUSH;
+
+	if (!bio_sectors(bio)) {
+		bio_endio(bio);
+		return;
+	}
+
+	/* status will be cleared if any member disk IO succeed */
+	bio->bi_status = BLK_STS_IOERR;
+
+	rdev_for_each(rdev, mddev) {
+		if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags))
+			continue;
+
+		new = bio_alloc_clone(rdev->bdev, bio, GFP_NOIO,
+				      &llbitmap->bio_set);
+		new->bi_iter.bi_sector = bio->bi_iter.bi_sector +
+					 rdev->sb_start +
+					 mddev->bitmap_info.offset;
+		new->bi_opf |= REQ_SYNC | REQ_IDLE | REQ_META;
+
+		llbitmap_bio = container_of(new, struct llbitmap_bio, bio);
+		llbitmap_bio->rdev = rdev;
+		bio_inc_remaining(bio);
+		new->bi_private = bio;
+
+		if (bio_data_dir(bio) == WRITE) {
+			new->bi_end_io = llbitmap_end_write;
+			new->bi_opf |= REQ_FUA;
+			submit_bio_noacct(new);
+			continue;
+		}
+
+		new->bi_end_io = llbitmap_end_read;
+		submit_bio_noacct(new);
+		break;
+	}
+
+	bio_endio(bio);
+}
+
+const struct block_device_operations llbitmap_fops = {
+	.owner = THIS_MODULE,
+	.submit_bio = llbitmap_submit_bio,
+};
+
+static int llbitmap_add_disk(struct llbitmap *llbitmap)
+{
+	struct mddev *mddev = llbitmap->mddev;
+	struct gendisk *disk = blk_alloc_disk(&mddev->gendisk->queue->limits,
+					      NUMA_NO_NODE);
+	int ret;
+
+	if (IS_ERR(disk))
+		return PTR_ERR(disk);
+
+	sprintf(disk->disk_name, "%s_bitmap", mdname(mddev));
+	disk->flags |= GENHD_FL_HIDDEN;
+	disk->fops = &llbitmap_fops;
+
+	ret = add_disk(disk);
+	if (ret) {
+		put_disk(disk);
+		return ret;
+	}
+
+	set_capacity(disk, BITMAP_MAX_SECTOR);
+	disk->private_data = mddev;
+	llbitmap->bitmap_disk = disk;
+	return 0;
+}
+
+static void llbitmap_del_disk(struct llbitmap *llbitmap)
+{
+	struct gendisk *disk = llbitmap->bitmap_disk;
+
+	if (!disk)
+		return;
+
+	llbitmap->bitmap_disk = NULL;
+	del_gendisk(disk);
+	put_disk(disk);
+}
+
+static int llbitmap_open_disk(struct llbitmap *llbitmap)
+{
+	struct gendisk *disk = llbitmap->bitmap_disk;
+	struct file *bitmap_file;
+
+	bitmap_file = bdev_file_alloc(disk->part0,
+				      BLK_OPEN_READ | BLK_OPEN_WRITE);
+	if (IS_ERR(bitmap_file))
+		return PTR_ERR(bitmap_file);
+
+	/* corresponding to the blkdev_put_no_open() from blkdev_release() */
+	get_device(disk_to_dev(disk));
+
+	bitmap_file->f_flags |= O_LARGEFILE;
+	bitmap_file->f_mode |= FMODE_CAN_ODIRECT;
+	bitmap_file->f_mapping = disk->part0->bd_mapping;
+	bitmap_file->f_wb_err = filemap_sample_wb_err(bitmap_file->f_mapping);
+
+	/* not actually opened, let blkdev_release() know */
+	bitmap_file->private_data = ERR_PTR(-ENODEV);
+	llbitmap->bitmap_file = bitmap_file;
+	return 0;
+}
+
+static void llbitmap_close_disk(struct llbitmap *llbitmap)
+{
+	struct file *bitmap_file = llbitmap->bitmap_file;
+
+	if (!bitmap_file)
+		return;
+
+	llbitmap->bitmap_file = NULL;
+	fput(bitmap_file);
+}
+
