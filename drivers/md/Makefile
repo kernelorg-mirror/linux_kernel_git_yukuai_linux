@@ -39,6 +39,7 @@ linear-y       += md-linear.o
 obj-$(CONFIG_MD_LINEAR)		+= linear.o
 obj-$(CONFIG_MD_RAID0)		+= raid0.o
 obj-$(CONFIG_MD_BITMAP)		+= md-bitmap.o
+obj-$(CONFIG_MD_LLBITMAP)	+= md-llbitmap.o
 obj-$(CONFIG_MD_RAID1)		+= raid1.o
 obj-$(CONFIG_MD_RAID10)		+= raid10.o
 obj-$(CONFIG_MD_RAID456)	+= raid456.o
