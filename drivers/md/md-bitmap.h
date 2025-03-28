@@ -74,7 +74,7 @@ struct bitmap_operations {
 	struct md_submodule_head head;
 
 	bool (*enabled)(void *data);
-	int (*create)(struct mddev *mddev, int slot);
+	int (*create)(struct mddev *mddev);
 	int (*resize)(struct mddev *mddev, sector_t blocks, int chunksize);
 
 	int (*load)(struct mddev *mddev);
