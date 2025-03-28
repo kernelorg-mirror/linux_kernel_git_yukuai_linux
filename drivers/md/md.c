@@ -8792,13 +8792,15 @@ static void md_bitmap_start(struct mddev *mddev,
 					   &md_io_clone->sectors);
 
 	mddev->bitmap_ops->startwrite(mddev, md_io_clone->offset,
-				      md_io_clone->sectors);
+				      md_io_clone->sectors,
+				      md_io_clone->is_discard);
 }
 
 static void md_bitmap_end(struct mddev *mddev, struct md_io_clone *md_io_clone)
 {
 	mddev->bitmap_ops->endwrite(mddev, md_io_clone->offset,
-				    md_io_clone->sectors);
+				    md_io_clone->sectors,
+				    md_io_clone->is_discard);
 }
 
 static void md_end_clone_io(struct bio *bio)
@@ -8837,6 +8839,10 @@ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
 	if (bio_data_dir(*bio) == WRITE && md_bitmap_enabled(mddev)) {
 		md_io_clone->offset = (*bio)->bi_iter.bi_sector;
 		md_io_clone->sectors = bio_sectors(*bio);
+		if (unlikely(bio_op(*bio) == REQ_OP_DISCARD))
+			md_io_clone->is_discard = true;
+		else
+			md_io_clone->is_discard = false;
 		md_bitmap_start(mddev, md_io_clone);
 	}
 

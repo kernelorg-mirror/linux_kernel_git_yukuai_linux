@@ -858,6 +858,7 @@ struct md_io_clone {
 	unsigned long	start_time;
 	sector_t	offset;
 	unsigned long	sectors;
+	bool		is_discard;
 	struct bio	bio_clone;
 };
 

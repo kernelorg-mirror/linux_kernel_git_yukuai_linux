@@ -1667,7 +1667,7 @@ __acquires(bitmap->lock)
 }
 
 static int bitmap_startwrite(struct mddev *mddev, sector_t offset,
-			     unsigned long sectors)
+			     unsigned long sectors, bool is_discard)
 {
 	struct bitmap *bitmap = mddev->bitmap;
 
@@ -1722,7 +1722,7 @@ static int bitmap_startwrite(struct mddev *mddev, sector_t offset,
 }
 
 static void bitmap_endwrite(struct mddev *mddev, sector_t offset,
-			    unsigned long sectors)
+			    unsigned long sectors, bool is_discard)
 {
 	struct bitmap *bitmap = mddev->bitmap;
 

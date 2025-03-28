@@ -91,9 +91,9 @@ struct bitmap_operations {
 	void (*wait_behind_writes)(struct mddev *mddev);
 
 	int (*startwrite)(struct mddev *mddev, sector_t offset,
-			  unsigned long sectors);
+			  unsigned long sectors, bool is_discard);
 	void (*endwrite)(struct mddev *mddev, sector_t offset,
-			 unsigned long sectors);
+			 unsigned long sectors, bool is_discard);
 	bool (*start_sync)(struct mddev *mddev, sector_t offset,
 			   sector_t *blocks, bool degraded);
 	void (*end_sync)(struct mddev *mddev, sector_t offset, sector_t *blocks);
