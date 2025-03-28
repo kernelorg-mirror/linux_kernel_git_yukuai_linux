@@ -23,6 +23,7 @@ enum bitmap_state {
 	BITMAP_STALE	   = 1,  /* the bitmap file is out of date or had -EIO */
 	BITMAP_WRITE_ERROR = 2, /* A write error has occurred */
 	BITMAP_FIRST_USE   = 3, /* llbtimap is just created */
+	BITMAP_DAEMON_BUSY = 4, /* llbitmap daemon is still not done after daemon_sleep */
 	BITMAP_HOSTENDIAN  =15,
 };
 

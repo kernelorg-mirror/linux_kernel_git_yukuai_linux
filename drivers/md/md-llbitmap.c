@@ -145,6 +145,7 @@ enum llbitmap_action {
 struct llbitmap_barrier {
 	struct percpu_ref active;
 	unsigned long expire;
+	bool flush;
 	wait_queue_head_t wait;
 } ____cacheline_aligned_in_smp;
 
@@ -180,6 +181,12 @@ struct llbitmap {
 struct llbitmap_bio {
 	struct md_rdev *rdev;
 	struct bio bio;
+};
+
+struct llbitmap_unplug_work {
+	struct work_struct work;
+	struct llbitmap *llbitmap;
+	struct completion *done;
 };
 
 static struct workqueue_struct *md_llbitmap_io_wq;
@@ -793,6 +800,54 @@ out:
 	return ret;
 }
 
+static void llbitmap_pending_timer_fn(struct timer_list *t)
+{
+	struct llbitmap *llbitmap = from_timer(llbitmap, t, pending_timer);
+
+	if (work_busy(&llbitmap->daemon_work)) {
+		pr_warn("daemon_work not finished\n");
+		set_bit(BITMAP_DAEMON_BUSY, &llbitmap->flags);
+		return;
+	}
+
+	queue_work(md_llbitmap_io_wq, &llbitmap->daemon_work);
+}
+
+static void md_llbitmap_daemon_fn(struct work_struct *work)
+{
+	struct llbitmap *llbitmap =
+		container_of(work, struct llbitmap, daemon_work);
+	unsigned long start = 0;
+	unsigned long end = min(llbitmap->chunks, PAGE_SIZE - BITMAP_SB_SIZE) - 1;
+	bool restart = false;
+	int page_idx = 0;
+
+	while (page_idx < llbitmap->nr_pages) {
+		struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+		if (page_idx > 0) {
+			start = end + 1;
+			end = min(end + PAGE_SIZE, llbitmap->chunks - 1);
+		}
+
+		if (!barrier->flush && time_before(jiffies, barrier->expire)) {
+			restart = true;
+			page_idx++;
+			continue;
+		}
+
+		llbitmap_suspend(llbitmap, page_idx);
+		llbitmap_state_machine(llbitmap, start, end, BitmapActionDaemon);
+		llbitmap_resume(llbitmap, page_idx);
+
+		page_idx++;
+	}
+
+	if (test_and_clear_bit(BITMAP_DAEMON_BUSY, &llbitmap->flags) || restart)
+		mod_timer(&llbitmap->pending_timer,
+			  jiffies + llbitmap->mddev->bitmap_info.daemon_sleep * HZ);
+}
+
 static int llbitmap_create(struct mddev *mddev)
 {
 	struct llbitmap *llbitmap;
@@ -905,6 +960,117 @@ static void llbitmap_destroy(struct mddev *mddev)
 	mutex_unlock(&mddev->bitmap_info.mutex);
 }
 
+static int llbitmap_startwrite(struct mddev *mddev, sector_t offset,
+			       unsigned long sectors, bool is_discard)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	enum llbitmap_action action;
+	unsigned long start;
+	unsigned long end;
+	int page_start;
+	int page_end;
+
+	if (likely(!is_discard)) {
+		start = offset >> llbitmap->chunkshift;
+		end = (offset + sectors - 1) >> llbitmap->chunkshift;
+		action = BitmapActionStartwrite;
+	} else {
+		/*
+		 * For discard, the bit can be handled only if the discard range
+		 * cover the whole bit, hence round start up, and end down.
+		 */
+		start = DIV_ROUND_UP(offset, llbitmap->chunksize);
+		end = (offset + sectors - 1) >> llbitmap->chunkshift;
+		action = BitmapActionDiscard;
+	}
+
+	llbitmap_state_machine(llbitmap, start, end, action);
+
+	page_start = (start + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+	page_end = (end + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+
+	while (page_start <= page_end) {
+		llbitmap_raise_barrier(llbitmap, page_start);
+		page_start++;
+	}
+
+	return 0;
+}
+
+static void llbitmap_endwrite(struct mddev *mddev, sector_t offset,
+			      unsigned long sectors, bool is_discard)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long start;
+	unsigned long end;
+	int page_start;
+	int page_end;
+
+	if (likely(!is_discard)) {
+		start = offset >> llbitmap->chunkshift;
+		end = (offset + sectors - 1) >> llbitmap->chunkshift;
+	} else {
+		/*
+		 * For discard, the bit can be handled only if the discard range
+		 * cover the whole bit, hence round start up, and end down.
+		 */
+		start = DIV_ROUND_UP(offset, llbitmap->chunksize);
+		end = (offset + sectors - 1) >> llbitmap->chunkshift;
+	}
+
+	page_start = (start + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+	page_end = (end + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+
+	while (page_start <= page_end) {
+		llbitmap_release_barrier(llbitmap, page_start);
+		page_start++;
+	}
+}
+
+static void llbitmap_unplug_fn(struct work_struct *work)
+{
+	struct llbitmap_unplug_work *unplug_work =
+		container_of(work, struct llbitmap_unplug_work, work);
+	struct llbitmap *llbitmap = unplug_work->llbitmap;
+
+	filemap_write_and_wait_range(llbitmap->bitmap_file->f_mapping,
+				     BITMAP_SB_SIZE,
+				     BITMAP_SB_SIZE + llbitmap->chunks - 1);
+	complete(unplug_work->done);
+}
+
+static void llbitmap_unplug(struct mddev *mddev, bool sync)
+{
+	DECLARE_COMPLETION_ONSTACK(done);
+	struct llbitmap *llbitmap = mddev->bitmap;
+	struct llbitmap_unplug_work unplug_work = {
+		.llbitmap = llbitmap,
+		.done = &done,
+	};
+
+	if (!mapping_tagged(llbitmap->bitmap_file->f_mapping,
+			    PAGECACHE_TAG_DIRTY))
+		return;
+
+	INIT_WORK_ONSTACK(&unplug_work.work, llbitmap_unplug_fn);
+	queue_work(md_llbitmap_unplug_wq, &unplug_work.work);
+	wait_for_completion(&done);
+	destroy_work_on_stack(&unplug_work.work);
+}
+
+static void llbitmap_flush(struct mddev *mddev)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	int i;
+
+	for (i = 0; i < llbitmap->nr_pages; i++)
+		llbitmap->barrier[i].flush = true;
+
+	del_timer_sync(&llbitmap->pending_timer);
+	queue_work(md_llbitmap_io_wq, &llbitmap->daemon_work);
+	flush_work(&llbitmap->daemon_work);
+}
+
 static struct bitmap_operations llbitmap_ops = {
 	.head = {
 		.type	= MD_BITMAP,
@@ -916,4 +1082,9 @@ static struct bitmap_operations llbitmap_ops = {
 	.resize			= llbitmap_resize,
 	.load			= llbitmap_load,
 	.destroy		= llbitmap_destroy,
+
+	.startwrite		= llbitmap_startwrite,
+	.endwrite		= llbitmap_endwrite,
+	.unplug			= llbitmap_unplug,
+	.flush			= llbitmap_flush,
 };
