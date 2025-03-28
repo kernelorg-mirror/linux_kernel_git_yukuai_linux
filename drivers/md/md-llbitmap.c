@@ -63,11 +63,28 @@
  * llbitmap_add_disk(). And a file is created as well to manage bitmap IO for
  * this disk, see details in llbitmap_open_disk(). Read/write bitmap is
  * converted to buffer IO to this file.
+ *
+ * IO fast path will set bits to dirty, and those dirty bits will be cleared
+ * by daemon after IO is done. llbitmap_barrier is used to syncronize between
+ * IO path and daemon;
+ *
+ * IO patch:
+ *  1) try to grab a reference, if succeed, set expire time after 5s and return;
+ *  2) wait for daemon to finish clearing dirty bits;
+ *
+ * Daemon(Daemon will be wake up every daemon_sleep seconds):
+ * For each page:
+ *  1) check if page expired, if not skip this page; for expired page:
+ *  2) suspend the page and wait for inflight write IO to be done;
+ *  3) change dirty page to clean;
+ *  4) resume the page;
  */
 
 #define BITMAP_MAX_SECTOR (128 * 2)
 #define BITMAP_MAX_PAGES 32
 #define BITMAP_SB_SIZE 1024
+
+#define BARRIER_IDLE 5
 
 enum llbitmap_state {
 	/* No valid data, init state after assemble the array */
@@ -115,6 +132,16 @@ enum llbitmap_action {
 	BitmapActionInit,
 };
 
+/*
+ * page level barrier to synchronize between dirty bit by write IO and clean bit
+ * by daemon.
+ */
+struct llbitmap_barrier {
+	struct percpu_ref active;
+	unsigned long expire;
+	wait_queue_head_t wait;
+} ____cacheline_aligned_in_smp;
+
 struct llbitmap {
 	struct mddev *mddev;
 	/* hidden disk to manage bitmap IO */
@@ -123,6 +150,7 @@ struct llbitmap {
 	struct file *bitmap_file;
 	int nr_pages;
 	struct page *pages[BITMAP_MAX_PAGES];
+	struct llbitmap_barrier barrier[BITMAP_MAX_PAGES];
 
 	struct bio_set bio_set;
 	struct bio_list retry_list;
@@ -490,5 +518,96 @@ static void llbitmap_close_disk(struct llbitmap *llbitmap)
 
 	llbitmap->bitmap_file = NULL;
 	fput(bitmap_file);
+}
+
+static void llbitmap_free_pages(struct llbitmap *llbitmap)
+{
+	int i;
+
+	for (i = 0; i < BITMAP_MAX_PAGES; i++) {
+		struct page *page = llbitmap->pages[i];
+
+		if (!page)
+			return;
+
+		llbitmap->pages[i] = NULL;
+		put_page(page);
+		percpu_ref_exit(&llbitmap->barrier[i].active);
+	}
+}
+
+static void llbitmap_raise_barrier(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+retry:
+	if (likely(percpu_ref_tryget_live(&barrier->active))) {
+		WRITE_ONCE(barrier->expire, jiffies + BARRIER_IDLE * HZ);
+		return;
+	}
+
+	wait_event(barrier->wait, !percpu_ref_is_dying(&barrier->active));
+	goto retry;
+}
+
+static void llbitmap_release_barrier(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+	percpu_ref_put(&barrier->active);
+}
+
+static void llbitmap_suspend(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+	percpu_ref_kill(&barrier->active);
+	wait_event(barrier->wait, percpu_ref_is_zero(&barrier->active));
+}
+
+static void llbitmap_resume(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+	barrier->expire = LONG_MAX;
+	percpu_ref_resurrect(&barrier->active);
+	wake_up(&barrier->wait);
+}
+
+static void active_release(struct percpu_ref *ref)
+{
+	struct llbitmap_barrier *barrier =
+		container_of(ref, struct llbitmap_barrier, active);
+
+	wake_up(&barrier->wait);
+}
+
+static int llbitmap_cache_pages(struct llbitmap *llbitmap)
+{
+	int nr_pages = (llbitmap->chunks + BITMAP_SB_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+	struct page *page;
+	int i = 0;
+
+	llbitmap->nr_pages = nr_pages;
+	while (i < nr_pages) {
+		page = read_mapping_page(llbitmap->bitmap_file->f_mapping, i, NULL);
+		if (IS_ERR(page)) {
+			int ret = PTR_ERR(page);
+
+			llbitmap_free_pages(llbitmap);
+			return ret;
+		}
+
+		if (percpu_ref_init(&llbitmap->barrier[i].active, active_release,
+				    PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
+			put_page(page);
+			return -ENOMEM;
+		}
+
+		init_waitqueue_head(&llbitmap->barrier[i].wait);
+		llbitmap->pages[i++] = page;
+	}
+
+	return 0;
 }
 
