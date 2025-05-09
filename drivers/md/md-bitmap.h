@@ -99,6 +99,7 @@ struct bitmap_operations {
 	void (*end_discard)(struct mddev *mddev, sector_t offset,
 			    unsigned long sectors);
 
+	sector_t (*skip_sync_blocks)(struct mddev *mddev, sector_t offset);
 	bool (*start_sync)(struct mddev *mddev, sector_t offset,
 			   sector_t *blocks, bool degraded);
 	void (*end_sync)(struct mddev *mddev, sector_t offset, sector_t *blocks);
