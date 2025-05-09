@@ -1159,3 +1159,128 @@ static void llbitmap_close_sync(struct mddev *mddev)
 
 	llbitmap_state_machine(llbitmap, 0, llbitmap->chunks - 1, BitmapActionEndsync);
 }
+
+static bool llbitmap_enabled(void *data)
+{
+	struct llbitmap *llbitmap = data;
+
+	return llbitmap && !test_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
+}
+
+static void llbitmap_dirty_bits(struct mddev *mddev, unsigned long s,
+				unsigned long e)
+{
+	llbitmap_state_machine(mddev->bitmap, s, e, BitmapActionStartwrite);
+}
+
+static void llbitmap_write_sb(struct llbitmap *llbitmap)
+{
+	int nr_bits = round_up(BITMAP_SB_SIZE, llbitmap->io_size) / llbitmap->io_size;
+
+	bitmap_fill(llbitmap->barrier[0].dirty, nr_bits);
+	llbitmap_write_page(llbitmap, 0);
+	md_super_wait(llbitmap->mddev);
+}
+
+static void llbitmap_update_sb(void *data)
+{
+	struct llbitmap *llbitmap = data;
+	struct mddev *mddev = llbitmap->mddev;
+	struct page *sb_page;
+	bitmap_super_t *sb;
+
+	if (test_bit(BITMAP_WRITE_ERROR, &llbitmap->flags))
+		return;
+
+	sb_page = llbitmap_read_page(llbitmap, 0);
+	if (IS_ERR(sb_page)) {
+		pr_err("%s: %s: read super block failed", __func__,
+		       mdname(mddev));
+		set_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
+		return;
+	}
+
+	if (mddev->events < llbitmap->events_cleared)
+		llbitmap->events_cleared = mddev->events;
+
+	sb = kmap_local_page(sb_page);
+	sb->events = cpu_to_le64(mddev->events);
+	sb->state = cpu_to_le32(llbitmap->flags);
+	sb->chunksize = cpu_to_le32(llbitmap->chunksize);
+	sb->sync_size = cpu_to_le64(mddev->resync_max_sectors);
+	sb->events_cleared = cpu_to_le64(llbitmap->events_cleared);
+	sb->sectors_reserved = cpu_to_le32(mddev->bitmap_info.space);
+	sb->daemon_sleep = cpu_to_le32(mddev->bitmap_info.daemon_sleep);
+
+	kunmap_local(sb);
+	llbitmap_write_sb(llbitmap);
+}
+
+static int llbitmap_get_stats(void *data, struct md_bitmap_stats *stats)
+{
+	struct llbitmap *llbitmap = data;
+
+	memset(stats, 0, sizeof(*stats));
+
+	stats->missing_pages = 0;
+	stats->pages = llbitmap->nr_pages;
+	stats->file_pages = llbitmap->nr_pages;
+
+	return 0;
+}
+
+static void llbitmap_write_all(struct mddev *mddev)
+{
+
+}
+
+static void llbitmap_daemon_work(struct mddev *mddev)
+{
+
+}
+
+static void llbitmap_start_behind_write(struct mddev *mddev)
+{
+
+}
+
+static void llbitmap_end_behind_write(struct mddev *mddev)
+{
+
+}
+
+static void llbitmap_wait_behind_writes(struct mddev *mddev)
+{
+
+}
+
+static void llbitmap_cond_end_sync(struct mddev *mddev, sector_t sector,
+				   bool force)
+{
+}
+
+static void llbitmap_sync_with_cluster(struct mddev *mddev,
+				       sector_t old_lo, sector_t old_hi,
+				       sector_t new_lo, sector_t new_hi)
+{
+
+}
+
+static void *llbitmap_get_from_slot(struct mddev *mddev, int slot)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static int llbitmap_copy_from_slot(struct mddev *mddev, int slot, sector_t *low,
+				   sector_t *high, bool clear_bits)
+{
+	return -EOPNOTSUPP;
+}
+
+static void llbitmap_set_pages(void *data, unsigned long pages)
+{
+}
+
+static void llbitmap_free(void *data)
+{
+}
