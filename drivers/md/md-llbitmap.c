@@ -279,3 +279,186 @@ static char state_machine[nr_llbitmap_state][nr_llbitmap_action] = {
 	[BitNeedSync] = {BitNone, BitSyncing, BitNone, BitNone, BitNone, BitNone, BitUnwritten, BitNone},
 	[BitSyncing] = {BitNone, BitSyncing, BitDirty, BitNeedSync, BitNeedSync, BitNone, BitUnwritten, BitNeedSync},
 };
+
+static bool is_raid456(struct mddev *mddev)
+{
+	return (mddev->level == 4 || mddev->level == 5 || mddev->level == 6);
+}
+
+static int llbitmap_read(struct llbitmap *llbitmap, enum llbitmap_state *state,
+			 loff_t pos)
+{
+	pos += BITMAP_SB_SIZE;
+	*state = llbitmap->barrier[pos >> PAGE_SHIFT].data[offset_in_page(pos)];
+	return 0;
+}
+
+static void llbitmap_set_page_dirty(struct llbitmap *llbitmap, int idx, int offset)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[idx];
+	bool level_456 = is_raid456(llbitmap->mddev);
+	int io_size = llbitmap->io_size;
+	int bit = offset / io_size;
+	bool infectious = false;
+	int pos;
+
+	if (!test_bit(LLPageDirty, &barrier->flags))
+		set_bit(LLPageDirty, &barrier->flags);
+
+	/*
+	 * if the bit is already dirty, or other page bytes is the same bit is
+	 * already BitDirty, then mark the whole bytes in the bit as dirty
+	 */
+	if (test_and_set_bit(bit, barrier->dirty)) {
+		infectious = true;
+	} else {
+		for (pos = bit * io_size; pos < (bit + 1) * io_size - 1;
+		     pos++) {
+			if (pos == offset)
+				continue;
+			if (barrier->data[pos] == BitDirty ||
+			    barrier->data[pos] == BitNeedSync) {
+				infectious = true;
+				break;
+			}
+		}
+
+	}
+
+	if (!infectious)
+		return;
+
+	for (pos = bit * io_size; pos < (bit + 1) * io_size - 1; pos++) {
+		if (pos == offset)
+			continue;
+
+		switch (barrier->data[pos]) {
+		case BitUnwritten:
+			barrier->data[pos] = level_456 ? BitNeedSync : BitDirty;
+			break;
+		case BitClean:
+			barrier->data[pos] = BitDirty;
+			break;
+		};
+	}
+}
+
+static int llbitmap_write(struct llbitmap *llbitmap, enum llbitmap_state state,
+			  loff_t pos)
+{
+	int idx;
+	int offset;
+
+	pos += BITMAP_SB_SIZE;
+	idx = pos >> PAGE_SHIFT;
+	offset = offset_in_page(pos);
+
+	llbitmap->barrier[idx].data[offset] = state;
+	if (state == BitDirty || state == BitNeedSync)
+		llbitmap_set_page_dirty(llbitmap, idx, offset);
+	return 0;
+}
+
+static void llbitmap_free_pages(struct llbitmap *llbitmap)
+{
+	int i;
+
+	for (i = 0; i < BITMAP_MAX_PAGES; i++) {
+		struct page *page = llbitmap->pages[i];
+
+		if (!page)
+			return;
+
+		llbitmap->pages[i] = NULL;
+		__free_page(page);
+		percpu_ref_exit(&llbitmap->barrier[i].active);
+	}
+}
+
+static struct page *llbitmap_read_page(struct llbitmap *llbitmap, int idx)
+{
+	struct page *page = llbitmap->pages[idx];
+	struct mddev *mddev = llbitmap->mddev;
+	struct md_rdev *rdev;
+
+	if (page)
+		return page;
+
+	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
+	if (!page)
+		return ERR_PTR(-ENOMEM);
+
+	rdev_for_each(rdev, mddev) {
+		sector_t sector;
+
+		if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags))
+			continue;
+
+		sector = mddev->bitmap_info.offset + (idx << PAGE_SECTORS_SHIFT);
+
+		if (sync_page_io(rdev, sector, PAGE_SIZE, page, REQ_OP_READ, true))
+			return page;
+
+		md_error(mddev, rdev);
+	}
+
+	__free_page(page);
+	return ERR_PTR(-EIO);
+}
+
+static void llbitmap_write_page(struct llbitmap *llbitmap, int idx)
+{
+	struct page *page = llbitmap->pages[idx];
+	struct mddev *mddev = llbitmap->mddev;
+	struct md_rdev *rdev;
+	int bit;
+
+	for (bit = 0; bit < llbitmap->bits_per_page; bit++) {
+		struct llbitmap_barrier *barrier = &llbitmap->barrier[idx];
+
+		if (!test_and_clear_bit(bit, barrier->dirty))
+			continue;
+
+		rdev_for_each(rdev, mddev) {
+			sector_t sector;
+			sector_t bit_sector = llbitmap->io_size >> SECTOR_SHIFT;
+
+			if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags))
+				continue;
+
+			sector = mddev->bitmap_info.offset + rdev->sb_start +
+				 (idx << PAGE_SECTORS_SHIFT) +
+				 bit * bit_sector;
+			md_super_write(mddev, rdev, sector, llbitmap->io_size,
+				       page, bit * llbitmap->io_size);
+		}
+	}
+}
+
+static int llbitmap_cache_pages(struct llbitmap *llbitmap)
+{
+	int nr_pages = (llbitmap->chunks + BITMAP_SB_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
+	struct page *page;
+	int i = 0;
+
+	llbitmap->nr_pages = nr_pages;
+	while (i < nr_pages) {
+		page = llbitmap_read_page(llbitmap, i);
+		if (IS_ERR(page)) {
+			llbitmap_free_pages(llbitmap);
+			return PTR_ERR(page);
+		}
+
+		if (percpu_ref_init(&llbitmap->barrier[i].active, active_release,
+				    PERCPU_REF_ALLOW_REINIT, GFP_KERNEL)) {
+			__free_page(page);
+			return -ENOMEM;
+		}
+
+		init_waitqueue_head(&llbitmap->barrier[i].wait);
+		llbitmap->barrier[i].data = page_address(page);
+		llbitmap->pages[i++] = page;
+	}
+
+	return 0;
+}
