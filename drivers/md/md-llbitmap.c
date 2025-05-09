@@ -784,6 +784,68 @@ out:
 	return ret;
 }
 
+static void llbitmap_pending_timer_fn(struct timer_list *t)
+{
+	struct llbitmap *llbitmap = from_timer(llbitmap, t, pending_timer);
+
+	if (work_busy(&llbitmap->daemon_work)) {
+		pr_warn("daemon_work not finished\n");
+		set_bit(BITMAP_DAEMON_BUSY, &llbitmap->flags);
+		return;
+	}
+
+	queue_work(md_llbitmap_io_wq, &llbitmap->daemon_work);
+}
+
+static void md_llbitmap_daemon_fn(struct work_struct *work)
+{
+	struct llbitmap *llbitmap =
+		container_of(work, struct llbitmap, daemon_work);
+	unsigned long start;
+	unsigned long end;
+	bool restart;
+	int idx;
+
+	if (llbitmap->mddev->degraded)
+		return;
+
+retry:
+	start = 0;
+	end = min(llbitmap->chunks, PAGE_SIZE - BITMAP_SB_SIZE) - 1;
+	restart = false;
+
+	for (idx = 0; idx < llbitmap->nr_pages; idx++) {
+		struct llbitmap_barrier *barrier = &llbitmap->barrier[idx];
+
+		if (idx > 0) {
+			start = end + 1;
+			end = min(end + PAGE_SIZE, llbitmap->chunks - 1);
+		}
+
+		if (!test_bit(LLPageFlush, &barrier->flags) &&
+		    time_before(jiffies, barrier->expire)) {
+			restart = true;
+			continue;
+		}
+
+		llbitmap_suspend(llbitmap, idx);
+		llbitmap_state_machine(llbitmap, start, end, BitmapActionDaemon);
+		llbitmap_resume(llbitmap, idx);
+	}
+
+	/*
+	 * If the daemon took a long time to finish, retry to prevent missing
+	 * clearing dirty bits.
+	 */
+	if (test_and_clear_bit(BITMAP_DAEMON_BUSY, &llbitmap->flags))
+		goto retry;
+
+	/* If some page is dirty but not expired, setup timer again */
+	if (restart)
+		mod_timer(&llbitmap->pending_timer,
+			  jiffies + llbitmap->mddev->bitmap_info.daemon_sleep * HZ);
+}
+
 static int llbitmap_create(struct mddev *mddev)
 {
 	struct llbitmap *llbitmap;
@@ -869,4 +931,148 @@ static void llbitmap_destroy(struct mddev *mddev)
 	llbitmap_free_pages(llbitmap);
 	kfree(llbitmap);
 	mutex_unlock(&mddev->bitmap_info.mutex);
+}
+
+static int llbitmap_startwrite(struct mddev *mddev, sector_t offset,
+			       unsigned long sectors)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long start = offset >> llbitmap->chunkshift;
+	unsigned long end = (offset + sectors - 1) >> llbitmap->chunkshift;
+	int page_start = (start + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+	int page_end = (end + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+
+	llbitmap_state_machine(llbitmap, start, end, BitmapActionStartwrite);
+
+
+	while (page_start <= page_end) {
+		llbitmap_raise_barrier(llbitmap, page_start);
+		page_start++;
+	}
+
+	return 0;
+}
+
+static void llbitmap_endwrite(struct mddev *mddev, sector_t offset,
+			      unsigned long sectors)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long start = offset >> llbitmap->chunkshift;
+	unsigned long end = (offset + sectors - 1) >> llbitmap->chunkshift;
+	int page_start = (start + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+	int page_end = (end + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+
+	while (page_start <= page_end) {
+		llbitmap_release_barrier(llbitmap, page_start);
+		page_start++;
+	}
+}
+
+static int llbitmap_start_discard(struct mddev *mddev, sector_t offset,
+				  unsigned long sectors)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long start = DIV_ROUND_UP(offset, llbitmap->chunksize);
+	unsigned long end = (offset + sectors - 1) >> llbitmap->chunkshift;
+	int page_start = (start + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+	int page_end = (end + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+
+	llbitmap_state_machine(llbitmap, start, end, BitmapActionDiscard);
+
+	while (page_start <= page_end) {
+		llbitmap_raise_barrier(llbitmap, page_start);
+		page_start++;
+	}
+
+	return 0;
+}
+
+static void llbitmap_end_discard(struct mddev *mddev, sector_t offset,
+				 unsigned long sectors)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long start = DIV_ROUND_UP(offset, llbitmap->chunksize);
+	unsigned long end = (offset + sectors - 1) >> llbitmap->chunkshift;
+	int page_start = (start + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+	int page_end = (end + BITMAP_SB_SIZE) >> PAGE_SHIFT;
+
+	while (page_start <= page_end) {
+		llbitmap_release_barrier(llbitmap, page_start);
+		page_start++;
+	}
+}
+
+static void llbitmap_unplug_fn(struct work_struct *work)
+{
+	struct llbitmap_unplug_work *unplug_work =
+		container_of(work, struct llbitmap_unplug_work, work);
+	struct llbitmap *llbitmap = unplug_work->llbitmap;
+	struct blk_plug plug;
+	int i;
+
+	blk_start_plug(&plug);
+
+	for (i = 0; i < llbitmap->nr_pages; i++) {
+		if (!test_bit(LLPageDirty, &llbitmap->barrier[i].flags) ||
+		    !test_and_clear_bit(LLPageDirty, &llbitmap->barrier[i].flags))
+			continue;
+
+		llbitmap_write_page(llbitmap, i);
+	}
+
+	blk_finish_plug(&plug);
+	md_super_wait(llbitmap->mddev);
+	complete(unplug_work->done);
+}
+
+static bool llbitmap_dirty(struct llbitmap *llbitmap)
+{
+	int i;
+
+	for (i = 0; i < llbitmap->nr_pages; i++)
+		if (test_bit(LLPageDirty, &llbitmap->barrier[i].flags))
+			return true;
+
+	return false;
+}
+
+static void llbitmap_unplug(struct mddev *mddev, bool sync)
+{
+	DECLARE_COMPLETION_ONSTACK(done);
+	struct llbitmap *llbitmap = mddev->bitmap;
+	struct llbitmap_unplug_work unplug_work = {
+		.llbitmap = llbitmap,
+		.done = &done,
+	};
+
+	if (!llbitmap_dirty(llbitmap))
+		return;
+
+	INIT_WORK_ONSTACK(&unplug_work.work, llbitmap_unplug_fn);
+	queue_work(md_llbitmap_unplug_wq, &unplug_work.work);
+	wait_for_completion(&done);
+	destroy_work_on_stack(&unplug_work.work);
+}
+
+static void llbitmap_flush(struct mddev *mddev)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	struct blk_plug plug;
+	int i;
+
+	for (i = 0; i < llbitmap->nr_pages; i++)
+		set_bit(LLPageFlush, &llbitmap->barrier[i].flags);
+
+	timer_delete_sync(&llbitmap->pending_timer);
+	queue_work(md_llbitmap_io_wq, &llbitmap->daemon_work);
+	flush_work(&llbitmap->daemon_work);
+
+	blk_start_plug(&plug);
+	for (i = 0; i < llbitmap->nr_pages; i++) {
+		/* mark all bits as dirty */
+		bitmap_fill(llbitmap->barrier[i].dirty, llbitmap->bits_per_page);
+		llbitmap_write_page(llbitmap, i);
+	}
+	blk_finish_plug(&plug);
+	md_super_wait(llbitmap->mddev);
 }
