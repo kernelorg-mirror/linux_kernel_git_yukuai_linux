@@ -1383,3 +1383,83 @@ static struct attribute *md_llbitmap_attrs[] = {
 	&llbitmap_daemon_sleep.attr,
 	NULL
 };
+
+static struct attribute_group md_llbitmap_group = {
+	.name = "llbitmap",
+	.attrs = md_llbitmap_attrs,
+};
+
+static struct bitmap_operations llbitmap_ops = {
+	.head = {
+		.type	= MD_BITMAP,
+		.id	= ID_LLBITMAP,
+		.name	= "llbitmap",
+	},
+
+	.enabled		= llbitmap_enabled,
+	.create			= llbitmap_create,
+	.resize			= llbitmap_resize,
+	.load			= llbitmap_load,
+	.destroy		= llbitmap_destroy,
+
+	.startwrite		= llbitmap_startwrite,
+	.endwrite		= llbitmap_endwrite,
+	.start_discard		= llbitmap_start_discard,
+	.end_discard		= llbitmap_end_discard,
+	.unplug			= llbitmap_unplug,
+	.flush			= llbitmap_flush,
+
+	.blocks_synced		= llbitmap_blocks_synced,
+	.skip_sync_blocks	= llbitmap_skip_sync_blocks,
+	.start_sync		= llbitmap_start_sync,
+	.end_sync		= llbitmap_end_sync,
+	.close_sync		= llbitmap_close_sync,
+
+	.update_sb		= llbitmap_update_sb,
+	.get_stats		= llbitmap_get_stats,
+	.dirty_bits		= llbitmap_dirty_bits,
+
+	/* not needed */
+	.write_all		= llbitmap_write_all,
+	.daemon_work		= llbitmap_daemon_work,
+	.cond_end_sync		= llbitmap_cond_end_sync,
+
+	/* not supported */
+	.start_behind_write	= llbitmap_start_behind_write,
+	.end_behind_write	= llbitmap_end_behind_write,
+	.wait_behind_writes	= llbitmap_wait_behind_writes,
+	.sync_with_cluster	= llbitmap_sync_with_cluster,
+	.get_from_slot		= llbitmap_get_from_slot,
+	.copy_from_slot		= llbitmap_copy_from_slot,
+	.set_pages		= llbitmap_set_pages,
+	.free			= llbitmap_free,
+
+	.group			= &md_llbitmap_group,
+};
+
+int md_llbitmap_init(void)
+{
+	md_llbitmap_io_wq = alloc_workqueue("md_llbitmap_io",
+					 WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+	if (!md_llbitmap_io_wq)
+		return -ENOMEM;
+
+	md_llbitmap_unplug_wq = alloc_workqueue("md_llbitmap_unplug",
+					 WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+	if (!md_llbitmap_unplug_wq) {
+		destroy_workqueue(md_llbitmap_io_wq);
+		md_llbitmap_io_wq = NULL;
+		return -ENOMEM;
+	}
+
+	return register_md_submodule(&llbitmap_ops.head);
+}
+
+void md_llbitmap_exit(void)
+{
+	destroy_workqueue(md_llbitmap_io_wq);
+	md_llbitmap_io_wq = NULL;
+	destroy_workqueue(md_llbitmap_unplug_wq);
+	md_llbitmap_unplug_wq = NULL;
+	unregister_md_submodule(&llbitmap_ops.head);
+}
