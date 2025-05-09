@@ -435,6 +435,14 @@ static void llbitmap_write_page(struct llbitmap *llbitmap, int idx)
 	}
 }
 
+static void active_release(struct percpu_ref *ref)
+{
+	struct llbitmap_barrier *barrier =
+		container_of(ref, struct llbitmap_barrier, active);
+
+	wake_up(&barrier->wait);
+}
+
 static int llbitmap_cache_pages(struct llbitmap *llbitmap)
 {
 	int nr_pages = (llbitmap->chunks + BITMAP_SB_SIZE + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -561,4 +569,42 @@ write_bitmap:
 	}
 
 	return state;
+}
+
+static void llbitmap_raise_barrier(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+retry:
+	if (likely(percpu_ref_tryget_live(&barrier->active))) {
+		WRITE_ONCE(barrier->expire, jiffies + BARRIER_IDLE * HZ);
+		return;
+	}
+
+	wait_event(barrier->wait, !percpu_ref_is_dying(&barrier->active));
+	goto retry;
+}
+
+static void llbitmap_release_barrier(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+	percpu_ref_put(&barrier->active);
+}
+
+static void llbitmap_suspend(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+	percpu_ref_kill(&barrier->active);
+	wait_event(barrier->wait, percpu_ref_is_zero(&barrier->active));
+}
+
+static void llbitmap_resume(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_barrier *barrier = &llbitmap->barrier[page_idx];
+
+	barrier->expire = LONG_MAX;
+	percpu_ref_resurrect(&barrier->active);
+	wake_up(&barrier->wait);
 }
