@@ -94,6 +94,11 @@ struct bitmap_operations {
 			  unsigned long sectors);
 	void (*endwrite)(struct mddev *mddev, sector_t offset,
 			 unsigned long sectors);
+	int (*start_discard)(struct mddev *mddev, sector_t offset,
+			     unsigned long sectors);
+	void (*end_discard)(struct mddev *mddev, sector_t offset,
+			    unsigned long sectors);
+
 	bool (*start_sync)(struct mddev *mddev, sector_t offset,
 			   sector_t *blocks, bool degraded);
 	void (*end_sync)(struct mddev *mddev, sector_t offset, sector_t *blocks);
