@@ -462,3 +462,103 @@ static int llbitmap_cache_pages(struct llbitmap *llbitmap)
 
 	return 0;
 }
+
+static void llbitmap_init_state(struct llbitmap *llbitmap)
+{
+	enum llbitmap_state state = BitUnwritten;
+	unsigned long i;
+
+	if (test_and_clear_bit(BITMAP_CLEAN, &llbitmap->flags))
+		state = BitClean;
+
+	for (i = 0; i < llbitmap->chunks; i++) {
+		int ret = llbitmap_write(llbitmap, state, i);
+
+		if (ret < 0) {
+			set_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
+			break;
+		}
+	}
+}
+
+/* The return value is only used from resync, where @start == @end. */
+static enum llbitmap_state llbitmap_state_machine(struct llbitmap *llbitmap,
+						  unsigned long start,
+						  unsigned long end,
+						  enum llbitmap_action action)
+{
+	struct mddev *mddev = llbitmap->mddev;
+	enum llbitmap_state state = BitNone;
+	bool need_resync = false;
+	bool need_recovery = false;
+
+	if (test_bit(BITMAP_WRITE_ERROR, &llbitmap->flags))
+		return BitNone;
+
+	if (action == BitmapActionInit) {
+		llbitmap_init_state(llbitmap);
+		return BitNone;
+	}
+
+	while (start <= end) {
+		ssize_t ret;
+		enum llbitmap_state c;
+
+		ret = llbitmap_read(llbitmap, &c, start);
+		if (ret < 0) {
+			set_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
+			return BitNone;
+		}
+
+		if (c < 0 || c >= nr_llbitmap_state) {
+			pr_err("%s: invalid bit %lu state %d action %d, forcing resync\n",
+			       __func__, start, c, action);
+			state = BitNeedSync;
+			goto write_bitmap;
+		}
+
+		if (c == BitNeedSync)
+			need_resync = true;
+
+		state = state_machine[c][action];
+		if (state == BitNone) {
+			start++;
+			continue;
+		}
+
+write_bitmap:
+		/* Delay raid456 initial recovery to first write. */
+		if (c == BitUnwritten && state == BitDirty &&
+		    action == BitmapActionStartwrite && is_raid456(mddev)) {
+			state = BitNeedSync;
+			need_recovery = true;
+		}
+
+		ret = llbitmap_write(llbitmap, state, start);
+		if (ret < 0) {
+			set_bit(BITMAP_WRITE_ERROR, &llbitmap->flags);
+			return BitNone;
+		}
+
+		if (state == BitNeedSync)
+			need_resync = true;
+		else if (state == BitDirty &&
+			 !timer_pending(&llbitmap->pending_timer))
+			mod_timer(&llbitmap->pending_timer,
+				  jiffies + mddev->bitmap_info.daemon_sleep * HZ);
+
+		start++;
+	}
+
+	if (need_recovery) {
+		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+		set_bit(MD_RECOVERY_LAZY_RECOVER, &mddev->recovery);
+		md_wakeup_thread(mddev->thread);
+	} else if (need_resync) {
+		set_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
+		set_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+		md_wakeup_thread(mddev->thread);
+	}
+
+	return state;
+}
