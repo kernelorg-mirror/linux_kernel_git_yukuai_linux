@@ -9,15 +9,6 @@
 
 #define BITMAP_MAGIC 0x6d746962
 
-typedef __u16 bitmap_counter_t;
-#define COUNTER_BITS 16
-#define COUNTER_BIT_SHIFT 4
-#define COUNTER_BYTE_SHIFT (COUNTER_BIT_SHIFT - 3)
-
-#define NEEDED_MASK ((bitmap_counter_t) (1 << (COUNTER_BITS - 1)))
-#define RESYNC_MASK ((bitmap_counter_t) (1 << (COUNTER_BITS - 2)))
-#define COUNTER_MAX ((bitmap_counter_t) RESYNC_MASK - 1)
-
 /*
  * version 3 is host-endian order, this is deprecated and not used for new
  * array
