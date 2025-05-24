@@ -1173,4 +1173,108 @@ static void llbitmap_flush(struct mddev *mddev)
 	__llbitmap_flush(mddev);
 }
 
+/* This is used for raid5 lazy initial recovery */
+static bool llbitmap_blocks_synced(struct mddev *mddev, sector_t offset)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long p = offset >> llbitmap->chunkshift;
+	enum llbitmap_state c = llbitmap_read(llbitmap, p);
+
+	return c == BitClean || c == BitDirty;
+}
+
+static sector_t llbitmap_skip_sync_blocks(struct mddev *mddev, sector_t offset)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long p = offset >> llbitmap->chunkshift;
+	int blocks = llbitmap->chunksize - (offset & (llbitmap->chunksize - 1));
+	enum llbitmap_state c = llbitmap_read(llbitmap, p);
+
+	/* always skip unwritten blocks */
+	if (c == BitUnwritten)
+		return blocks;
+
+	/* For resync also skip clean/dirty blocks */
+	if ((c == BitClean || c == BitDirty) &&
+	    test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
+	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery))
+		return blocks;
+
+	return 0;
+}
+
+static bool llbitmap_start_sync(struct mddev *mddev, sector_t offset,
+				sector_t *blocks, bool degraded)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long p = offset >> llbitmap->chunkshift;
+
+	/*
+	 * Handle one bit at a time, this is much simpler. And it doesn't matter
+	 * if md_do_sync() loop more times.
+	 */
+	*blocks = llbitmap->chunksize - (offset & (llbitmap->chunksize - 1));
+	return llbitmap_state_machine(llbitmap, p, p,
+				      BitmapActionStartsync) == BitSyncing;
+}
+
+/* Something is wrong, sync_thread stop at @offset */
+static void llbitmap_end_sync(struct mddev *mddev, sector_t offset,
+			      sector_t *blocks)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	unsigned long p = offset >> llbitmap->chunkshift;
+
+	*blocks = llbitmap->chunksize - (offset & (llbitmap->chunksize - 1));
+	llbitmap_state_machine(llbitmap, p, llbitmap->chunks - 1,
+			       BitmapActionAbortsync);
+}
+
+/* A full sync_thread is finished */
+static void llbitmap_close_sync(struct mddev *mddev)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+	int i;
+
+	for (i = 0; i < llbitmap->nr_pages; i++) {
+		struct llbitmap_page_ctl *pctl = llbitmap->pctl[i];
+
+		/* let daemon_fn clear dirty bits immediately */
+		WRITE_ONCE(pctl->expire, jiffies);
+	}
+
+	llbitmap_state_machine(llbitmap, 0, llbitmap->chunks - 1,
+			       BitmapActionEndsync);
+}
+
+/*
+ * sync_thread have reached @sector, update metadata every daemon_sleep seconds,
+ * just in case sync_thread have to restart after power failure.
+ */
+static void llbitmap_cond_end_sync(struct mddev *mddev, sector_t sector,
+				   bool force)
+{
+	struct llbitmap *llbitmap = mddev->bitmap;
+
+	if (sector == 0) {
+		llbitmap->last_end_sync = jiffies;
+		return;
+	}
+
+	if (time_before(jiffies, llbitmap->last_end_sync +
+				 HZ * mddev->bitmap_info.daemon_sleep))
+		return;
+
+	wait_event(mddev->recovery_wait, !atomic_read(&mddev->recovery_active));
+
+	mddev->curr_resync_completed = sector;
+	set_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags);
+	llbitmap_state_machine(llbitmap, 0, sector >> llbitmap->chunkshift,
+			       BitmapActionEndsync);
+	__llbitmap_flush(mddev);
+
+	llbitmap->last_end_sync = jiffies;
+	sysfs_notify_dirent_safe(mddev->sysfs_completed);
+}
+
 #endif /* CONFIG_MD_LLBITMAP */
