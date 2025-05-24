@@ -651,4 +651,42 @@ write_bitmap:
 	return state;
 }
 
+static void llbitmap_raise_barrier(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_page_ctl *pctl = llbitmap->pctl[page_idx];
+
+retry:
+	if (likely(percpu_ref_tryget_live(&pctl->active))) {
+		WRITE_ONCE(pctl->expire, jiffies + BARRIER_IDLE * HZ);
+		return;
+	}
+
+	wait_event(pctl->wait, !percpu_ref_is_dying(&pctl->active));
+	goto retry;
+}
+
+static void llbitmap_release_barrier(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_page_ctl *pctl = llbitmap->pctl[page_idx];
+
+	percpu_ref_put(&pctl->active);
+}
+
+static void llbitmap_suspend(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_page_ctl *pctl = llbitmap->pctl[page_idx];
+
+	percpu_ref_kill(&pctl->active);
+	wait_event(pctl->wait, percpu_ref_is_zero(&pctl->active));
+}
+
+static void llbitmap_resume(struct llbitmap *llbitmap, int page_idx)
+{
+	struct llbitmap_page_ctl *pctl = llbitmap->pctl[page_idx];
+
+	pctl->expire = LONG_MAX;
+	percpu_ref_resurrect(&pctl->active);
+	wake_up(&pctl->wait);
+}
+
 #endif /* CONFIG_MD_LLBITMAP */
