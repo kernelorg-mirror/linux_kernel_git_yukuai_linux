@@ -444,6 +444,19 @@ If bitmap_type is bitmap, then the md device will also contain:
      once the array becomes non-degraded, and this fact has been
      recorded in the metadata.
 
+If bitmap_type is llbitmap, then the md device will also contain:
+
+  llbitmap/bits
+     This is readonly, show status of bitmap bits, the number of each
+     value.
+
+  llbitmap/metadata
+     This is readonly, show bitmap metadata, include chunksize, chunkshift,
+     chunks, offset and daemon_sleep.
+
+  llbitmap/daemon_sleep
+     This is readwrite, time in seconds that daemon function will be
+     triggered to clear dirty bits.
 As component devices are added to an md array, they appear in the ``md``
 directory as new directories named::
 
