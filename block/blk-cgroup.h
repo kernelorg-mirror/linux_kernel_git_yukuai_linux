@@ -126,6 +126,11 @@ static inline struct blkcg *css_to_blkcg(struct cgroup_subsys_state *css)
 	return css ? container_of(css, struct blkcg, css) : NULL;
 }
 
+static inline struct blkcg *bio_blkcg(struct bio *bio)
+{
+	return bio->bi_blkcg;
+}
+
 /*
  * A blkcg_gq (blkg) is association between a block cgroup (blkcg) and a
  * request_queue (q).  This is used by blkcg policies which need to track
@@ -259,7 +264,7 @@ static inline bool bio_issue_as_root_blkg(struct bio *bio)
  *
  * Lookup a blkg for the @blkcg - @q pair, whether it is online or dying.
  *
- * Must be called in a RCU critical section.
+ * Must be called with either RCU read lock or queue_lock held.
  *
  * This does not acquire a reference.  The caller must already hold one, or
  * have the blkg pinned by I/O.
@@ -267,8 +272,9 @@ static inline bool bio_issue_as_root_blkg(struct bio *bio)
 static inline struct blkcg_gq *blkg_lookup_any(struct blkcg *blkcg,
 					       struct request_queue *q)
 {
-	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
-			 "blkg_lookup_any() requires an RCU read lock");
+	RCU_LOCKDEP_WARN(!rcu_read_lock_held() &&
+			 !lockdep_is_held(&q->queue_lock),
+			 "blkg_lookup_any() requires an RCU read lock or queue_lock");
 
 	return rhashtable_lookup(&q->blkg_hash, &blkcg->css.id,
 				 blkg_hash_params);
@@ -281,7 +287,7 @@ static inline struct blkcg_gq *blkg_lookup_any(struct blkcg *blkcg,
  *
  * Lookup an online blkg for the @blkcg - @q pair.
  *
- * Must be called in a RCU critical section.
+ * Must be called with either RCU read lock or queue_lock held.
  */
 static inline struct blkcg_gq *blkg_lookup(struct blkcg *blkcg,
 					   struct request_queue *q)
@@ -296,6 +302,9 @@ static inline struct blkcg_gq *blkg_lookup(struct blkcg *blkcg,
 		blkg = NULL;
 	return blkg;
 }
+
+struct blkcg_gq *bio_blkg_lookup(struct bio *bio);
+struct blkcg_gq *bio_blkg(struct bio *bio);
 
 /**
  * blkg_to_pd - get policy private data
@@ -362,6 +371,18 @@ static inline bool blkg_tryget(struct blkcg_gq *blkg)
 static inline void blkg_put(struct blkcg_gq *blkg)
 {
 	percpu_ref_put(&blkg->refcnt);
+}
+
+static inline void bio_clear_blkcg(struct bio *bio)
+{
+	struct blkcg *blkcg = bio_blkcg(bio);
+
+	bio_put_blkg_ref(bio);
+
+	if (blkcg) {
+		css_put(&blkcg->css);
+		bio->bi_blkcg = NULL;
+	}
 }
 
 /**
@@ -493,7 +514,7 @@ static inline void blkcg_clear_delay(struct blkcg_gq *blkg)
  */
 static inline bool blk_cgroup_mergeable(struct request *rq, struct bio *bio)
 {
-	return rq->bio->bi_blkg == bio->bi_blkg &&
+	return bio_blkcg(rq->bio) == bio_blkcg(bio) &&
 		bio_issue_as_root_blkg(rq->bio) == bio_issue_as_root_blkg(bio);
 }
 
@@ -519,6 +540,9 @@ struct blkcg_policy {
 struct blkcg {
 };
 
+static inline struct blkcg *bio_blkcg(struct bio *bio) { return NULL; }
+static inline struct blkcg_gq *bio_blkg_lookup(struct bio *bio) { return NULL; }
+static inline struct blkcg_gq *bio_blkg(struct bio *bio) { return NULL; }
 static inline struct blkcg_gq *blkg_lookup_any(struct blkcg *blkcg, void *key) { return NULL; }
 static inline struct blkcg_gq *blkg_lookup(struct blkcg *blkcg, void *key) { return NULL; }
 static inline int blkg_init_queue(struct request_queue *q) { return 0; }
@@ -537,6 +561,7 @@ static inline struct blkg_policy_data *blkg_to_pd(struct blkcg_gq *blkg,
 static inline struct blkcg_gq *pd_to_blkg(struct blkg_policy_data *pd) { return NULL; }
 static inline void blkg_get(struct blkcg_gq *blkg) { }
 static inline void blkg_put(struct blkcg_gq *blkg) { }
+static inline void bio_clear_blkcg(struct bio *bio) { }
 static inline void blk_cgroup_bio_start(struct bio *bio) { }
 static inline bool blk_cgroup_mergeable(struct request *rq, struct bio *bio) { return true; }
 
