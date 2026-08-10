@@ -66,6 +66,13 @@ static DEFINE_RAW_SPINLOCK(blkg_stat_lock);
 
 #define BLKG_DESTROY_BATCH_SIZE  64
 
+const struct rhashtable_params blkg_hash_params = {
+	.key_len		= sizeof_field(struct blkcg_gq, blkcg_id),
+	.key_offset		= offsetof(struct blkcg_gq, blkcg_id),
+	.head_offset		= offsetof(struct blkcg_gq, q_hash_node),
+	.automatic_shrinking	= true,
+};
+
 /*
  * Lockless lists for tracking IO stats update
  *
@@ -193,6 +200,16 @@ static void blkg_release(struct percpu_ref *ref)
 	struct blkcg_gq *blkg = container_of(ref, struct blkcg_gq, refcnt);
 	struct blkcg *blkcg = blkg->blkcg;
 	int cpu;
+
+	/*
+	 * A blkg that was never inserted into q->blkg_list has no hash
+	 * entry.  This happens when allocation or creation fails before
+	 * rhashtable_insert_fast() succeeds.
+	 */
+	if (!list_empty(&blkg->q_node))
+		WARN_ON_ONCE(rhashtable_remove_fast(&blkg->q->blkg_hash,
+						    &blkg->q_hash_node,
+						    blkg_hash_params));
 
 	/*
 	 * Flush all the non-empty percpu lockless lists before releasing
@@ -327,6 +344,7 @@ static struct blkcg_gq *blkg_alloc(struct blkcg *blkcg, struct gendisk *disk,
 	blkg->q = disk->queue;
 	INIT_LIST_HEAD(&blkg->q_node);
 	blkg->blkcg = blkcg;
+	blkg->blkcg_id = blkcg->css.id;
 	blkg->iostat.blkg = blkg;
 #ifdef CONFIG_BLK_CGROUP_PUNT_BIO
 	spin_lock_init(&blkg->async_bio_lock);
@@ -423,7 +441,8 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg, struct gendisk *disk,
 
 	/* insert */
 	spin_lock(&blkcg->lock);
-	ret = radix_tree_insert(&blkcg->blkg_tree, disk->queue->id, blkg);
+	ret = rhashtable_insert_fast(&disk->queue->blkg_hash,
+				     &blkg->q_hash_node, blkg_hash_params);
 	if (likely(!ret)) {
 		hlist_add_head_rcu(&blkg->blkcg_node, &blkcg->blkg_list);
 		list_add(&blkg->q_node, &disk->queue->blkg_list);
@@ -476,9 +495,6 @@ static struct blkcg_gq *blkg_lookup_create(struct blkcg *blkcg,
 	rcu_read_lock();
 	blkg = blkg_lookup(blkcg, q);
 	if (blkg) {
-		if (blkcg != &blkcg_root &&
-		    blkg != rcu_dereference(blkcg->blkg_hint))
-			rcu_assign_pointer(blkcg->blkg_hint, blkg);
 		rcu_read_unlock();
 		return blkg;
 	}
@@ -546,16 +562,7 @@ static void blkg_destroy(struct blkcg_gq *blkg)
 
 	blkg->online = false;
 
-	radix_tree_delete(&blkcg->blkg_tree, blkg->q->id);
 	hlist_del_init_rcu(&blkg->blkcg_node);
-
-	/*
-	 * Both setting lookup hint to and clearing it from @blkg are done
-	 * under queue_lock.  If it's not pointing to @blkg now, it never
-	 * will.  Hint assignment itself can race safely.
-	 */
-	if (rcu_access_pointer(blkcg->blkg_hint) == blkg)
-		rcu_assign_pointer(blkcg->blkg_hint, NULL);
 
 	/*
 	 * Put the reference taken at the time of creation so that when all
@@ -882,18 +889,12 @@ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
 			goto fail_exit;
 		}
 
-		if (radix_tree_preload(GFP_KERNEL)) {
-			blkg_free(new_blkg);
-			ret = -ENOMEM;
-			goto fail_exit;
-		}
-
 		spin_lock_irq(&q->queue_lock);
 
 		if (!blkcg_policy_enabled(q, pol)) {
 			blkg_free(new_blkg);
 			ret = -EOPNOTSUPP;
-			goto fail_preloaded;
+			goto fail_unlock;
 		}
 
 		blkg = blkg_lookup(pos, q);
@@ -903,11 +904,9 @@ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
 			blkg = blkg_create(pos, disk, new_blkg);
 			if (IS_ERR(blkg)) {
 				ret = PTR_ERR(blkg);
-				goto fail_preloaded;
+				goto fail_unlock;
 			}
 		}
-
-		radix_tree_preload_end();
 
 		if (pos == blkcg)
 			goto success;
@@ -917,8 +916,6 @@ success:
 	ctx->blkg = blkg;
 	return 0;
 
-fail_preloaded:
-	radix_tree_preload_end();
 fail_unlock:
 	spin_unlock_irq(&q->queue_lock);
 fail_exit:
@@ -1420,7 +1417,6 @@ blkcg_css_alloc(struct cgroup_subsys_state *parent_css)
 
 	spin_lock_init(&blkcg->lock);
 	refcount_set(&blkcg->online_pin, 1);
-	INIT_RADIX_TREE(&blkcg->blkg_tree, GFP_NOWAIT);
 	INIT_HLIST_HEAD(&blkcg->blkg_list);
 #ifdef CONFIG_CGROUP_WRITEBACK
 	INIT_LIST_HEAD(&blkcg->cgwb_list);
@@ -1457,17 +1453,22 @@ static int blkcg_css_online(struct cgroup_subsys_state *css)
 	return 0;
 }
 
-void blkg_init_queue(struct request_queue *q)
+int blkg_init_queue(struct request_queue *q)
 {
 	INIT_LIST_HEAD(&q->blkg_list);
 	mutex_init(&q->blkcg_mutex);
+	return rhashtable_init(&q->blkg_hash, &blkg_hash_params);
+}
+
+void blkg_exit_queue(struct request_queue *q)
+{
+	rhashtable_destroy(&q->blkg_hash);
 }
 
 int blkcg_init_disk(struct gendisk *disk)
 {
 	struct request_queue *q = disk->queue;
 	struct blkcg_gq *new_blkg, *blkg;
-	bool preloaded;
 
 	/*
 	 * If the queue is shared across disk rebind (e.g., SCSI), the
@@ -1485,8 +1486,6 @@ int blkcg_init_disk(struct gendisk *disk)
 	if (!new_blkg)
 		return -ENOMEM;
 
-	preloaded = !radix_tree_preload(GFP_KERNEL);
-
 	/* Make sure the root blkg exists. */
 	/* spin_lock_irq can serve as RCU read-side critical section. */
 	spin_lock_irq(&q->queue_lock);
@@ -1496,15 +1495,10 @@ int blkcg_init_disk(struct gendisk *disk)
 	q->root_blkg = blkg;
 	spin_unlock_irq(&q->queue_lock);
 
-	if (preloaded)
-		radix_tree_preload_end();
-
 	return 0;
 
 err_unlock:
 	spin_unlock_irq(&q->queue_lock);
-	if (preloaded)
-		radix_tree_preload_end();
 	return PTR_ERR(blkg);
 }
 

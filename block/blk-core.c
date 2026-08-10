@@ -303,6 +303,7 @@ static void blk_free_queue(struct request_queue *q)
 	if (queue_is_mq(q))
 		blk_mq_release(q);
 
+	blkg_exit_queue(q);
 	ida_free(&blk_queue_ida, q->id);
 	lockdep_unregister_key(&q->io_lock_cls_key);
 	lockdep_unregister_key(&q->q_lock_cls_key);
@@ -481,7 +482,9 @@ struct request_queue *blk_alloc_queue(struct queue_limits *lim, int node_id)
 	init_waitqueue_head(&q->mq_freeze_wq);
 	mutex_init(&q->mq_freeze_lock);
 
-	blkg_init_queue(q);
+	error = blkg_init_queue(q);
+	if (error)
+		goto fail_stats;
 
 	/*
 	 * Init percpu_ref in atomic mode so that it's faster to shutdown.
@@ -491,7 +494,7 @@ struct request_queue *blk_alloc_queue(struct queue_limits *lim, int node_id)
 				blk_queue_usage_counter_release,
 				PERCPU_REF_INIT_ATOMIC, GFP_KERNEL);
 	if (error)
-		goto fail_stats;
+		goto fail_blkg;
 	lockdep_register_key(&q->io_lock_cls_key);
 	lockdep_register_key(&q->q_lock_cls_key);
 	lockdep_init_map(&q->io_lockdep_map, "&q->q_usage_counter(io)",
@@ -510,6 +513,8 @@ struct request_queue *blk_alloc_queue(struct queue_limits *lim, int node_id)
 
 	return q;
 
+fail_blkg:
+	blkg_exit_queue(q);
 fail_stats:
 	blk_free_queue_stats(q->stats);
 fail_id:

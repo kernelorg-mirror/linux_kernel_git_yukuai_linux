@@ -19,6 +19,8 @@
 #include <linux/kthread.h>
 #include <linux/blk-mq.h>
 #include <linux/llist.h>
+#include <linux/rhashtable.h>
+#include <linux/rcupdate.h>
 #include "blk.h"
 
 struct blkcg_gq;
@@ -56,9 +58,11 @@ struct blkg_iostat_set {
 struct blkcg_gq {
 	/* Pointer to the associated request_queue */
 	struct request_queue		*q;
+	struct rhash_head		q_hash_node;
 	struct list_head		q_node;
 	struct hlist_node		blkcg_node;
 	struct blkcg			*blkcg;
+	int				blkcg_id;
 
 	/* all non-root blkcg_gq's are guaranteed to have access to parent */
 	struct blkcg_gq			*parent;
@@ -98,8 +102,6 @@ struct blkcg {
 	/* If there is block congestion on this cgroup. */
 	atomic_t			congestion_count;
 
-	struct radix_tree_root		blkg_tree;
-	struct blkcg_gq	__rcu		*blkg_hint;
 	struct hlist_head		blkg_list;
 
 	struct blkcg_policy_data	*cpd[BLKCG_MAX_POLS];
@@ -192,8 +194,10 @@ struct blkcg_policy {
 
 extern struct blkcg blkcg_root;
 extern bool blkcg_debug_stats;
+extern const struct rhashtable_params blkg_hash_params;
 
-void blkg_init_queue(struct request_queue *q);
+int blkg_init_queue(struct request_queue *q);
+void blkg_exit_queue(struct request_queue *q);
 int blkcg_init_disk(struct gendisk *disk);
 void blkcg_exit_disk(struct gendisk *disk);
 
@@ -249,11 +253,33 @@ static inline bool bio_issue_as_root_blkg(struct bio *bio)
 }
 
 /**
- * blkg_lookup - lookup blkg for the specified blkcg - q pair
+ * blkg_lookup_any - lookup any blkg for the specified blkcg - q pair
  * @blkcg: blkcg of interest
  * @q: request_queue of interest
  *
- * Lookup blkg for the @blkcg - @q pair.
+ * Lookup a blkg for the @blkcg - @q pair, whether it is online or dying.
+ *
+ * Must be called in a RCU critical section.
+ *
+ * This does not acquire a reference.  The caller must already hold one, or
+ * have the blkg pinned by I/O.
+ */
+static inline struct blkcg_gq *blkg_lookup_any(struct blkcg *blkcg,
+					       struct request_queue *q)
+{
+	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
+			 "blkg_lookup_any() requires an RCU read lock");
+
+	return rhashtable_lookup(&q->blkg_hash, &blkcg->css.id,
+				 blkg_hash_params);
+}
+
+/**
+ * blkg_lookup - lookup an online blkg for the specified blkcg - q pair
+ * @blkcg: blkcg of interest
+ * @q: request_queue of interest
+ *
+ * Lookup an online blkg for the @blkcg - @q pair.
  *
  * Must be called in a RCU critical section.
  */
@@ -265,13 +291,8 @@ static inline struct blkcg_gq *blkg_lookup(struct blkcg *blkcg,
 	if (blkcg == &blkcg_root)
 		return q->root_blkg;
 
-	blkg = rcu_dereference_check(blkcg->blkg_hint,
-			lockdep_is_held(&q->queue_lock));
-	if (blkg && blkg->q == q)
-		return blkg;
-
-	blkg = radix_tree_lookup(&blkcg->blkg_tree, q->id);
-	if (blkg && blkg->q != q)
+	blkg = blkg_lookup_any(blkcg, q);
+	if (blkg && !READ_ONCE(blkg->online))
 		blkg = NULL;
 	return blkg;
 }
@@ -498,8 +519,10 @@ struct blkcg_policy {
 struct blkcg {
 };
 
+static inline struct blkcg_gq *blkg_lookup_any(struct blkcg *blkcg, void *key) { return NULL; }
 static inline struct blkcg_gq *blkg_lookup(struct blkcg *blkcg, void *key) { return NULL; }
-static inline void blkg_init_queue(struct request_queue *q) { }
+static inline int blkg_init_queue(struct request_queue *q) { return 0; }
+static inline void blkg_exit_queue(struct request_queue *q) { }
 static inline int blkcg_init_disk(struct gendisk *disk) { return 0; }
 static inline void blkcg_exit_disk(struct gendisk *disk) { }
 static inline int blkcg_policy_register(struct blkcg_policy *pol) { return 0; }
