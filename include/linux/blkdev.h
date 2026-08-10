@@ -27,6 +27,7 @@
 #include <linux/xarray.h>
 #include <linux/file.h>
 #include <linux/lockdep.h>
+#include <linux/rhashtable-types.h>
 
 struct module;
 struct request_queue;
@@ -581,6 +582,7 @@ struct request_queue {
 #ifdef CONFIG_BLK_CGROUP
 	DECLARE_BITMAP		(blkcg_pols, BLKCG_MAX_POLS);
 	struct blkcg_gq		*root_blkg;
+	struct rhashtable	blkg_hash;
 	struct list_head	blkg_list;
 	struct mutex		blkcg_mutex;
 #endif
