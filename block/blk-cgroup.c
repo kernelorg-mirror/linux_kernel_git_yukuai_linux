@@ -475,18 +475,20 @@ static struct blkcg_gq *blkg_lookup_tryget(struct blkcg_gq *blkg)
  * blkg_lookup_create - lookup blkg, try to create one if not there
  * @blkcg: blkcg of interest
  * @disk: gendisk of interest
+ * @gfp_mask: allocation mask to use
+ * @blkgp: out parameter for the target blkg, or closest blkg on failure
  *
  * Lookup blkg for the @blkcg - @disk pair.  If it doesn't exist, try to
  * create one.  blkg creation is performed recursively from blkcg_root such
  * that all non-root blkg's have access to the parent blkg.  This function
  * must be called with @disk->queue->blkcg_mutex held.
  *
- * Returns the closest blkg with an extra reference acquired.  If
- * blkg_create() fails while walking down from root, the returned blkg may
- * belong to an ancestor of @blkcg.  This function never returns %NULL.
+ * On success, *@blkgp points to the target blkg and 0 is returned.  On
+ * failure, *@blkgp points to the closest blkg and the errno is returned.
+ * The returned blkg does not have an extra reference acquired.
  */
-static struct blkcg_gq *blkg_lookup_create(struct blkcg *blkcg,
-		struct gendisk *disk)
+static int blkg_lookup_create(struct blkcg *blkcg, struct gendisk *disk,
+			      gfp_t gfp_mask, struct blkcg_gq **blkgp)
 {
 	struct request_queue *q = disk->queue;
 	struct blkcg_gq *blkg;
@@ -496,9 +498,9 @@ static struct blkcg_gq *blkg_lookup_create(struct blkcg *blkcg,
 	rcu_read_lock();
 	blkg = blkg_lookup(blkcg, q);
 	if (blkg) {
-		blkg = blkg_lookup_tryget(blkg);
+		*blkgp = blkg;
 		rcu_read_unlock();
-		return blkg;
+		return 0;
 	}
 	rcu_read_unlock();
 
@@ -525,16 +527,16 @@ static struct blkcg_gq *blkg_lookup_create(struct blkcg *blkcg,
 		}
 		rcu_read_unlock();
 
-		blkg = blkg_create(pos, disk, GFP_NOIO);
+		blkg = blkg_create(pos, disk, gfp_mask);
 		if (IS_ERR(blkg)) {
-			blkg = ret_blkg;
-			break;
+			*blkgp = ret_blkg;
+			return PTR_ERR(blkg);
 		}
-		if (pos == blkcg)
-			break;
+		if (pos == blkcg) {
+			*blkgp = blkg;
+			return 0;
+		}
 	}
-
-	return blkg_lookup_tryget(blkg);
 }
 
 static void blkg_destroy(struct blkcg_gq *blkg)
@@ -846,48 +848,10 @@ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
 		goto fail_unlock;
 	}
 
-	rcu_read_lock();
-	blkg = blkg_lookup(blkcg, q);
-	rcu_read_unlock();
-	if (blkg)
-		goto success;
+	ret = blkg_lookup_create(blkcg, disk, GFP_NOIO, &blkg);
+	if (ret)
+		goto fail_unlock;
 
-	/*
-	 * Create blkgs walking down from blkcg_root to @blkcg, so that all
-	 * non-root blkgs have access to their parents.
-	 */
-	while (true) {
-		struct blkcg *pos = blkcg;
-		struct blkcg *parent;
-
-		parent = blkcg_parent(blkcg);
-		rcu_read_lock();
-		while (parent && !blkg_lookup(parent, q)) {
-			pos = parent;
-			parent = blkcg_parent(parent);
-		}
-		rcu_read_unlock();
-
-		if (!blkcg_policy_enabled(q, pol)) {
-			ret = -EOPNOTSUPP;
-			goto fail_unlock;
-		}
-
-		rcu_read_lock();
-		blkg = blkg_lookup(pos, q);
-		rcu_read_unlock();
-		if (!blkg) {
-			blkg = blkg_create(pos, disk, GFP_NOIO);
-			if (IS_ERR(blkg)) {
-				ret = PTR_ERR(blkg);
-				goto fail_unlock;
-			}
-		}
-
-		if (pos == blkcg)
-			goto success;
-	}
-success:
 	ctx->blkg = blkg;
 	return 0;
 
@@ -2126,7 +2090,8 @@ struct blkcg_gq *bio_blkg(struct bio *bio)
 	}
 
 	mutex_lock(&q->blkcg_mutex);
-	blkg = blkg_lookup_create(blkcg, disk);
+	blkg_lookup_create(blkcg, disk, GFP_NOIO, &blkg);
+	blkg = blkg_lookup_tryget(blkg);
 	mutex_unlock(&q->blkcg_mutex);
 
 	bio_set_blkg_ref(bio, blkg);
