@@ -385,14 +385,10 @@ out_free_blkg:
 	return NULL;
 }
 
-/*
- * If @new_blkg is %NULL, this function tries to allocate a new one as
- * necessary using %GFP_NOWAIT.  @new_blkg is always consumed on return.
- */
 static struct blkcg_gq *blkg_create(struct blkcg *blkcg, struct gendisk *disk,
-				    struct blkcg_gq *new_blkg)
+				    gfp_t gfp_mask)
 {
-	struct blkcg_gq *blkg;
+	struct blkcg_gq *blkg = NULL;
 	int i, ret;
 
 	lockdep_assert_held(&disk->queue->blkcg_mutex);
@@ -403,15 +399,11 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg, struct gendisk *disk,
 		goto err_free_blkg;
 	}
 
-	/* allocate */
-	if (!new_blkg) {
-		new_blkg = blkg_alloc(blkcg, disk, GFP_NOWAIT);
-		if (unlikely(!new_blkg)) {
-			ret = -ENOMEM;
-			goto err_free_blkg;
-		}
+	blkg = blkg_alloc(blkcg, disk, gfp_mask);
+	if (unlikely(!blkg)) {
+		ret = -ENOMEM;
+		goto err_free_blkg;
 	}
-	blkg = new_blkg;
 
 	/* link parent */
 	if (blkcg_parent(blkcg)) {
@@ -463,8 +455,8 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg, struct gendisk *disk,
 	return ERR_PTR(ret);
 
 err_free_blkg:
-	if (new_blkg)
-		blkg_free(new_blkg);
+	if (blkg)
+		blkg_free(blkg);
 	return ERR_PTR(ret);
 }
 
@@ -533,7 +525,7 @@ static struct blkcg_gq *blkg_lookup_create(struct blkcg *blkcg,
 		}
 		rcu_read_unlock();
 
-		blkg = blkg_create(pos, disk, NULL);
+		blkg = blkg_create(pos, disk, GFP_NOIO);
 		if (IS_ERR(blkg)) {
 			blkg = ret_blkg;
 			break;
@@ -867,7 +859,6 @@ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
 	while (true) {
 		struct blkcg *pos = blkcg;
 		struct blkcg *parent;
-		struct blkcg_gq *new_blkg;
 
 		parent = blkcg_parent(blkcg);
 		rcu_read_lock();
@@ -877,14 +868,7 @@ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
 		}
 		rcu_read_unlock();
 
-		new_blkg = blkg_alloc(pos, disk, GFP_NOIO);
-		if (unlikely(!new_blkg)) {
-			ret = -ENOMEM;
-			goto fail_unlock;
-		}
-
 		if (!blkcg_policy_enabled(q, pol)) {
-			blkg_free(new_blkg);
 			ret = -EOPNOTSUPP;
 			goto fail_unlock;
 		}
@@ -892,10 +876,8 @@ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
 		rcu_read_lock();
 		blkg = blkg_lookup(pos, q);
 		rcu_read_unlock();
-		if (blkg) {
-			blkg_free(new_blkg);
-		} else {
-			blkg = blkg_create(pos, disk, new_blkg);
+		if (!blkg) {
+			blkg = blkg_create(pos, disk, GFP_NOIO);
 			if (IS_ERR(blkg)) {
 				ret = PTR_ERR(blkg);
 				goto fail_unlock;
@@ -1468,7 +1450,7 @@ void blkg_exit_queue(struct request_queue *q)
 int blkcg_init_disk(struct gendisk *disk)
 {
 	struct request_queue *q = disk->queue;
-	struct blkcg_gq *new_blkg, *blkg;
+	struct blkcg_gq *blkg;
 
 	/*
 	 * If the queue is shared across disk rebind (e.g., SCSI), the
@@ -1478,13 +1460,9 @@ int blkcg_init_disk(struct gendisk *disk)
 	 */
 	wait_var_event(&q->blkg_list, list_empty_careful(&q->blkg_list));
 
-	new_blkg = blkg_alloc(&blkcg_root, disk, GFP_KERNEL);
-	if (!new_blkg)
-		return -ENOMEM;
-
 	/* Make sure the root blkg exists. */
 	mutex_lock(&q->blkcg_mutex);
-	blkg = blkg_create(&blkcg_root, disk, new_blkg);
+	blkg = blkg_create(&blkcg_root, disk, GFP_KERNEL);
 	if (IS_ERR(blkg))
 		goto err_unlock;
 	q->root_blkg = blkg;
