@@ -30,6 +30,7 @@
 #include <linux/resume_user_mode.h>
 #include <linux/psi.h>
 #include <linux/part_stat.h>
+#include <linux/preempt.h>
 #include "blk.h"
 #include "blk-cgroup.h"
 #include "blk-ioprio.h"
@@ -468,6 +469,20 @@ static struct blkcg_gq *blkg_lookup_tryget(struct blkcg_gq *blkg)
 {
 	while (!blkg_tryget(blkg))
 		blkg = blkg->parent;
+	return blkg;
+}
+
+static struct blkcg_gq *blkg_lookup_closest(struct blkcg *blkcg,
+					    struct request_queue *q)
+{
+	struct blkcg_gq *blkg;
+
+	rcu_read_lock();
+	while (!(blkg = blkg_lookup(blkcg, q)))
+		blkcg = blkcg_parent(blkcg);
+	blkg = blkg_lookup_tryget(blkg);
+	rcu_read_unlock();
+
 	return blkg;
 }
 
@@ -2068,7 +2083,6 @@ struct blkcg_gq *bio_blkg(struct bio *bio)
 	struct gendisk *disk;
 	struct request_queue *q;
 	struct blkcg_gq *blkg;
-	int ret;
 
 	if (!blkcg || !bio->bi_bdev)
 		return NULL;
@@ -2085,6 +2099,25 @@ struct blkcg_gq *bio_blkg(struct bio *bio)
 		blkg = blkg_lookup_tryget(blkg);
 	rcu_read_unlock();
 	if (blkg) {
+		bio_set_blkg_ref(bio, blkg);
+		return blkg;
+	}
+
+	if (bio->bi_opf & REQ_NOWAIT) {
+		/*
+		 * Nowait callers must not sleep on the mutex nor allocate with
+		 * sleeping GFPs.  Trylock the mutex and create the missing blkg
+		 * atomically.  If the mutex cannot be acquired, skip allocation
+		 * and pin the closest existing blkg instead.  blkg_lookup_create()
+		 * provides the same fallback if allocation fails.
+		 */
+		if (!preemptible() || !mutex_trylock(&q->blkcg_mutex)) {
+			blkg = blkg_lookup_closest(blkcg, q);
+		} else {
+			blkg_lookup_create(blkcg, disk, GFP_ATOMIC, &blkg);
+			blkg = blkg_lookup_tryget(blkg);
+			mutex_unlock(&q->blkcg_mutex);
+		}
 		bio_set_blkg_ref(bio, blkg);
 		return blkg;
 	}
