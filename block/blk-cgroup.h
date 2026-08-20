@@ -70,7 +70,7 @@ struct blkcg_gq {
 	/* reference count */
 	struct percpu_ref		refcnt;
 
-	/* is this blkg online? protected by both blkcg and q locks */
+	/* is this blkg online? protected by blkcg->lock and q->blkcg_mutex */
 	bool				online;
 
 	struct blkg_iostat_set __percpu	*iostat_cpu;
@@ -231,9 +231,9 @@ int blkg_conf_open_bdev(struct blkg_conf_ctx *ctx)
 	__cond_acquires(0, &ctx->bdev->bd_queue->rq_qos_mutex);
 int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
 		   struct blkg_conf_ctx *ctx)
-	__cond_acquires(0, &ctx->bdev->bd_disk->queue->queue_lock);
+	__cond_acquires(0, &ctx->bdev->bd_disk->queue->blkcg_mutex);
 void blkg_conf_unprep(struct blkg_conf_ctx *ctx)
-	__releases(ctx->bdev->bd_disk->queue->queue_lock);
+	__releases(ctx->bdev->bd_disk->queue->blkcg_mutex);
 void blkg_conf_close_bdev(struct blkg_conf_ctx *ctx)
 	__releases(&ctx->bdev->bd_queue->rq_qos_mutex);
 
@@ -390,9 +390,8 @@ static inline void bio_clear_blkcg(struct bio *bio)
  * @p_blkg: target blkg to walk descendants of
  *
  * Walk @c_blkg through the descendants of @p_blkg.  Must be used with RCU
- * read locked.  If called under either blkcg or queue lock, the iteration
- * is guaranteed to include all and only online blkgs.  The caller may
- * update @pos_css by calling css_rightmost_descendant() to skip subtree.
+ * read locked.  The caller may update @pos_css by calling
+ * css_rightmost_descendant() to skip subtree.
  * @p_blkg is included in the iteration and the first node to be visited.
  */
 #define blkg_for_each_descendant_pre(d_blkg, pos_css, p_blkg)		\

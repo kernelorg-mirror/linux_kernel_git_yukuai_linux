@@ -2775,7 +2775,8 @@ retry_lock:
 static void ioc_rqos_merge(struct rq_qos *rqos, struct request *rq,
 			   struct bio *bio)
 {
-	struct ioc_gq *iocg = blkg_to_iocg(bio_blkg(bio));
+	struct blkcg_gq *blkg = bio_blkg_lookup(rq->bio);
+	struct ioc_gq *iocg = blkg_to_iocg(blkg);
 	struct ioc *ioc = rqos_to_ioc(rqos);
 	sector_t bio_end = bio_end_sector(bio);
 	struct ioc_now now;
@@ -3154,6 +3155,7 @@ static ssize_t ioc_weight_write(struct kernfs_open_file *of, char *buf,
 	struct blkg_conf_ctx ctx;
 	struct ioc_now now;
 	struct ioc_gq *iocg;
+	unsigned long flags;
 	u32 v;
 	int ret;
 
@@ -3206,11 +3208,11 @@ static ssize_t ioc_weight_write(struct kernfs_open_file *of, char *buf,
 			goto unprep;
 	}
 
-	spin_lock(&iocg->ioc->lock);
+	spin_lock_irqsave(&iocg->ioc->lock, flags);
 	iocg->cfg_weight = v * WEIGHT_ONE;
 	ioc_now(iocg->ioc, &now);
 	weight_updated(iocg, &now);
-	spin_unlock(&iocg->ioc->lock);
+	spin_unlock_irqrestore(&iocg->ioc->lock, flags);
 
 	ret = 0;
 
