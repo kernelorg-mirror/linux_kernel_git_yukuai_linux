@@ -1550,17 +1550,18 @@ struct cgroup_subsys io_cgrp_subsys = {
 };
 EXPORT_SYMBOL_GPL(io_cgrp_subsys);
 
-/*
- * Tear down per-blkg policy data for @pol on @q.
- */
-static void blkcg_policy_teardown_pds(struct request_queue *q,
-				      const struct blkcg_policy *pol)
+static struct blkg_policy_data *
+blkcg_policy_detach_pd(struct request_queue *q,
+		       const struct blkcg_policy *pol)
 {
+	struct blkg_policy_data *pd = NULL;
 	struct blkcg_gq *blkg;
 
+	lockdep_assert_held(&q->blkcg_mutex);
+
+	spin_lock_irq(&q->queue_lock);
 	list_for_each_entry(blkg, &q->blkg_list, q_node) {
 		struct blkcg *blkcg = blkg->blkcg;
-		struct blkg_policy_data *pd;
 
 		spin_lock(&blkcg->lock);
 		pd = blkg->pd[pol->plid];
@@ -1568,11 +1569,28 @@ static void blkcg_policy_teardown_pds(struct request_queue *q,
 			if (pd->online && pol->pd_offline_fn)
 				pol->pd_offline_fn(pd);
 			pd->online = false;
-			pol->pd_free_fn(pd);
 			WRITE_ONCE(blkg->pd[pol->plid], NULL);
 		}
 		spin_unlock(&blkcg->lock);
+
+		if (pd)
+			break;
 	}
+	spin_unlock_irq(&q->queue_lock);
+
+	return pd;
+}
+
+/*
+ * Tear down per-blkg policy data for @pol on @q.
+ */
+static void blkcg_policy_teardown_pds(struct request_queue *q,
+				      const struct blkcg_policy *pol)
+{
+	struct blkg_policy_data *pd;
+
+	while ((pd = blkcg_policy_detach_pd(q, pol)))
+		pol->pd_free_fn(pd);
 }
 
 /**
@@ -1689,9 +1707,7 @@ out:
 
 enomem:
 	/* alloc failed, take down everything */
-	spin_lock_irq(&q->queue_lock);
 	blkcg_policy_teardown_pds(q, pol);
-	spin_unlock_irq(&q->queue_lock);
 	ret = -ENOMEM;
 	goto out;
 }
@@ -1721,8 +1737,9 @@ void blkcg_deactivate_policy(struct gendisk *disk,
 	spin_lock_irq(&q->queue_lock);
 
 	__clear_bit(pol->plid, q->blkcg_pols);
-	blkcg_policy_teardown_pds(q, pol);
 	spin_unlock_irq(&q->queue_lock);
+
+	blkcg_policy_teardown_pds(q, pol);
 	mutex_unlock(&q->blkcg_mutex);
 
 	if (queue_is_mq(q))
